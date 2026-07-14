@@ -1,0 +1,20 @@
+# 240 MHz like the Arduino build — at IDF's 160 MHz default the FFSK demod
+# can't keep up with real-time audio (decoder feedDrops climb immediately).
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=20000
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=25
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+CONFIG_FREERTOS_HZ=1000
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=8192
+# The adc_continuous DMA ISR must live in IRAM: it fires 200x/s while e.g. the
+# WiFi stack writes NVS with the flash cache disabled. Without this the device
+# crashes with "Cache disabled but cached memory region accessed" (seen on
+# hardware the moment the setup AP saved its config).
+CONFIG_ADC_CONTINUOUS_ISR_IRAM_SAFE=y

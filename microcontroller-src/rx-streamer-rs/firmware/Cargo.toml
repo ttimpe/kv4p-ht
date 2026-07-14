@@ -1,0 +1,50 @@
+[package]
+name = "kv4p-rx-streamer"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+license = "GPL-3.0-or-later"
+description = "RX-only WiFi audio streaming firmware for the kv4p-ht board (ESP32-WROOM-32 + SA818)"
+
+[[bin]]
+name = "kv4p-rx-streamer"
+test = false
+
+[dependencies]
+# esp-idf-svc re-exports `hal` (esp-idf-hal) and `sys` (esp-idf-sys), so those
+# two are pulled in with matched versions rather than pinned separately here.
+esp-idf-svc = { version = "0.51", features = ["binstart"] }
+log = "0.4"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+heapless = "0.8"
+# Telegram decoders (both host-tested; see their crates for the DSP details).
+# ffsk-decode lives in a sibling checkout of this repo; default-features off
+# drops its CLI/WAV/chrono extras, leaving zero transitive deps.
+ffsk-decode = { path = "../../../../ffsk-decode", default-features = false }
+nemo-decode = { path = "../nemo-decode" }
+
+[build-dependencies]
+embuild = "0.33"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+
+[profile.dev]
+# Debug builds still need real optimization or the ESP-IDF blobs bloat the
+# image past the OTA slot; keep the audio DSP fast enough for real-time.
+opt-level = "z"
+
+[package.metadata.esp-idf-sys]
+esp_idf_sdkconfig_defaults = "sdkconfig.defaults"
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/mdns", version = "1.2" }
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp_websocket_client", version = "1.1.0" }

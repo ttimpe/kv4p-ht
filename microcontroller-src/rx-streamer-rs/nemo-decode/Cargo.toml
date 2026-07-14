@@ -1,0 +1,14 @@
+[package]
+name = "nemo-decode"
+version = "0.1.0"
+edition = "2021"
+description = "Host-portable NEMO / VicosLio \"G2\" telegram decoder (48 kHz i16 in, HDLC frames out)"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "nemo_decode"
+
+# No runtime dependencies: pure stdint/math port, buildable on stock stable Rust.
+
+[dev-dependencies]
+hound = "3"
