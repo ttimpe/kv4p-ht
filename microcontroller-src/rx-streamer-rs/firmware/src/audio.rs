@@ -9,13 +9,80 @@
 //! unit-testable on the host; only [`AdcCapture`] and [`dac_bias`] touch the
 //! peripheral FFI.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use esp_idf_svc::sys;
 
 use crate::config::{AppState, CAPTURE_SAMPLE_RATE, FRAME_SAMPLES_16K, FRAME_SAMPLES_48K};
 
 pub const FIR_TAPS: usize = 65;
+
+/// Peak absolute sample of the most recent pre-squelch 16 kHz frame (0..32767),
+/// published by the frame pump for the `[status]` log.
+///
+/// This is the gauge that separates "the RF/ADC path is dead" from "there is
+/// audio but the decoder isn't configured" — the two failure modes look
+/// identical in the frame counters alone. Pre-squelch on purpose: with the
+/// squelch closed the stream copy is muted, but this still shows the noise
+/// floor, so a plausible reading here proves the ADC is alive even on a silent
+/// channel.
+#[derive(Default)]
+pub struct AudioLevel {
+    peak: AtomicU32,
+}
+
+/// ADC delivery counters, for diagnosing a starved capture path. `accepted`
+/// should track `conversions` almost exactly and `conversions` should advance
+/// at CAPTURE_SAMPLE_RATE; any gap localizes the loss (channel-tag mismatch vs.
+/// the DMA simply not producing).
+#[derive(Default)]
+pub struct AdcStats {
+    /// 16-bit conversion words parsed out of the DMA buffer.
+    pub conversions: AtomicU32,
+    /// Conversions whose channel tag matched, i.e. actually kept.
+    pub accepted: AtomicU32,
+    /// Conversions discarded because the channel tag did not match.
+    pub ch_mismatch: AtomicU32,
+    /// `adc_continuous_read` calls that returned nothing.
+    pub timeouts: AtomicU32,
+    /// First raw DMA word seen, for decoding the on-wire format once.
+    pub first_word: AtomicU32,
+}
+
+/// DMA pool overflows, counted in the driver's ISR callback. Non-zero means the
+/// ADC produced faster than the audio thread consumed, so the driver dropped
+/// samples — the stream then has *gaps*, which is far more destructive to FFSK
+/// than a mere rate error: the bit clock slips at every gap. Static rather than
+/// carried through `user_data` because the callback runs in ISR context.
+pub static ADC_POOL_OVF: AtomicU32 = AtomicU32::new(0);
+
+// Must live in IRAM: sdkconfig sets CONFIG_ADC_CONTINUOUS_ISR_IRAM_SAFE=y, and
+// the driver rejects a callback in flash (ESP_ERR_INVALID_ARG) — which silently
+// kills ADC bring-up entirely.
+#[link_section = ".iram1.adc_pool_ovf"]
+unsafe extern "C" fn on_pool_ovf(
+    _h: sys::adc_continuous_handle_t,
+    _e: *const sys::adc_continuous_evt_data_t,
+    _user: *mut core::ffi::c_void,
+) -> bool {
+    ADC_POOL_OVF.fetch_add(1, Ordering::Relaxed);
+    false // no task woken
+}
+
+impl AudioLevel {
+    pub fn update(&self, buf16k: &[i16]) {
+        let peak = buf16k
+            .iter()
+            .map(|s| s.unsigned_abs() as u32)
+            .max()
+            .unwrap_or(0);
+        self.peak.store(peak, Ordering::Relaxed);
+    }
+
+    pub fn peak(&self) -> u32 {
+        self.peak.load(Ordering::Relaxed)
+    }
+}
 
 // --- One-pole DC blocker (same time constant as upstream's DCOffsetRemover) ---
 
@@ -174,7 +241,26 @@ pub fn dac_bias(adc_bias_volts: f32) {
 // ESP32 DMA result is `adc_digi_output_data_t` TYPE1: 2 bytes, bits[11:0]=data,
 // bits[15:12]=channel. VERIFY(phase2): SOC_ADC_DIGI_RESULT_BYTES == 2 on ESP32.
 const RESULT_BYTES: usize = 2;
+/// Per-read size. Keep at 1 kB: `AdcCapture` holds `dma`/`pending` inline and
+/// lives on the audio thread's stack, which overflows if these grow.
 const DMA_READ_BYTES: usize = 1024;
+/// DMA pool depth (driver-allocated, not on our stack). 4 kB is ~42 ms at
+/// 48 kHz, which measures as ample: with the audio thread on core 1 the pool
+/// never overflows (`poolovf` stays 0). Enlarging it was tried and changed
+/// nothing except costing ~28 kB of heap, which the uplink's TLS handshake
+/// needs more.
+const DMA_POOL_BYTES: usize = DMA_READ_BYTES * 4;
+
+/// Rate we ASK the driver for, to actually get [`CAPTURE_SAMPLE_RATE`].
+///
+/// On this ESP32 + IDF 5.3, `adc_continuous` delivers a stable 0.8192x of the
+/// requested `sample_freq_hz` (measured: request 48000 -> 39321.6 Hz, over many
+/// 5 s windows, with zero pool overflows and zero dropped conversions — so it
+/// is the hardware clock, not lost samples). Undoing that factor here keeps the
+/// true capture rate at 48 kHz, which the whole DSP chain and the 16 kHz stream
+/// header depend on. Getting this wrong does not sound broken — it silently
+/// skews the FFSK bit clock and every telegram fails CRC.
+const ADC_REQUEST_HZ: u32 = (CAPTURE_SAMPLE_RATE as f32 / 0.8192) as u32; // 58593
 
 /// ADC1 continuous (I2S-DMA-backed) capture on a single channel. Written
 /// against the raw `adc_continuous_*` FFI rather than the HAL wrapper, which
@@ -182,6 +268,7 @@ const DMA_READ_BYTES: usize = 1024;
 pub struct AdcCapture {
     handle: sys::adc_continuous_handle_t,
     channel: u8,
+    stats: std::sync::Arc<AdcStats>,
     dma: [u8; DMA_READ_BYTES],
     /// Samples decoded from the last DMA burst that did not fit the caller's
     /// buffer; drained first on the next read (a DMA burst never yields more
@@ -200,10 +287,10 @@ unsafe impl Send for AdcCapture {}
 impl AdcCapture {
     /// Start continuous capture on `channel` (ADC1) at 48 kHz, 12-bit, with the
     /// board's attenuation. Mirrors the ADC portion of C `audioInit()`.
-    pub fn new(channel: u8, atten: sys::adc_atten_t) -> AdcCapture {
+    pub fn new(channel: u8, atten: sys::adc_atten_t, stats: std::sync::Arc<AdcStats>) -> AdcCapture {
         let handle = unsafe {
             let mut hcfg: sys::adc_continuous_handle_cfg_t = core::mem::zeroed();
-            hcfg.max_store_buf_size = (DMA_READ_BYTES * 4) as u32;
+            hcfg.max_store_buf_size = DMA_POOL_BYTES as u32;
             hcfg.conv_frame_size = DMA_READ_BYTES as u32;
             let mut handle: sys::adc_continuous_handle_t = core::ptr::null_mut();
             let mut err = sys::adc_continuous_new_handle(&hcfg, &mut handle);
@@ -218,10 +305,19 @@ impl AdcCapture {
                 let mut ccfg: sys::adc_continuous_config_t = core::mem::zeroed();
                 ccfg.pattern_num = 1;
                 ccfg.adc_pattern = &mut pattern;
-                ccfg.sample_freq_hz = CAPTURE_SAMPLE_RATE;
+                ccfg.sample_freq_hz = ADC_REQUEST_HZ;
                 ccfg.conv_mode = sys::adc_digi_convert_mode_t_ADC_CONV_SINGLE_UNIT_1;
                 ccfg.format = sys::adc_digi_output_format_t_ADC_DIGI_OUTPUT_FORMAT_TYPE1;
                 err = sys::adc_continuous_config(handle, &ccfg);
+            }
+            if err == sys::ESP_OK {
+                let mut cbs: sys::adc_continuous_evt_cbs_t = core::mem::zeroed();
+                cbs.on_pool_ovf = Some(on_pool_ovf);
+                err = sys::adc_continuous_register_event_callbacks(
+                    handle,
+                    &cbs,
+                    core::ptr::null_mut(),
+                );
             }
             if err == sys::ESP_OK {
                 err = sys::adc_continuous_start(handle);
@@ -241,6 +337,7 @@ impl AdcCapture {
         AdcCapture {
             handle,
             channel,
+            stats,
             dma: [0u8; DMA_READ_BYTES],
             pending: [0i16; DMA_READ_BYTES / RESULT_BYTES],
             pending_len: 0,
@@ -285,17 +382,25 @@ impl AdcCapture {
             )
         };
         if err != sys::ESP_OK || got == 0 {
+            self.stats.timeouts.fetch_add(1, Ordering::Relaxed);
             return n;
         }
         let mut i = 0usize;
         while i + RESULT_BYTES <= got as usize {
             let raw = u16::from_le_bytes([self.dma[i], self.dma[i + 1]]);
             i += RESULT_BYTES;
+            self.stats.conversions.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .first_word
+                .compare_exchange(0, raw as u32, Ordering::Relaxed, Ordering::Relaxed)
+                .ok();
             let data = raw & 0x0FFF;
             let ch = ((raw >> 12) & 0x0F) as u8;
             if ch != self.channel {
+                self.stats.ch_mismatch.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
+            self.stats.accepted.fetch_add(1, Ordering::Relaxed);
             if n < out.len() {
                 out[n] = data as i16;
                 n += 1;

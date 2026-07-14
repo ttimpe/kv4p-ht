@@ -38,7 +38,7 @@ use esp_idf_svc::hal::units::Hertz;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sys;
 
-use crate::audio::{AdcCapture, AudioPipeline};
+use crate::audio::{AdcCapture, AdcStats, AudioLevel, AudioPipeline};
 use crate::broadcast_ring::BroadcastRing;
 use crate::config::{AppState, FRAME_SAMPLES_16K};
 use crate::decoder::{AudioFrame, DecoderShared};
@@ -72,6 +72,10 @@ pub struct SharedState {
     pub decoder: Arc<DecoderShared>,
     pub ota_in_progress: Arc<AtomicBool>,
     pub squelch_open: Arc<AtomicBool>,
+    /// Pre-squelch peak audio level, published by the frame pump.
+    pub audio_level: Arc<AudioLevel>,
+    /// ADC delivery counters (diagnosing a starved capture path).
+    pub adc_stats: Arc<AdcStats>,
     /// Backend uplink status (mode/connected/last-error) for `/api/status`.
     pub uplink: Arc<UplinkStatus>,
     /// OTA updater status (+ the wake condvar the web POST kicks).
@@ -165,7 +169,12 @@ fn main() -> anyhow::Result<()> {
 
     // --- Audio: DAC bias, ADC continuous capture, DSP pipeline ---
     audio::dac_bias(hw.adc_bias);
-    let adc = AdcCapture::new(board::I2S_ADC_CHANNEL, hw.adc_attenuation);
+    let adc_stats = Arc::new(AdcStats::default());
+    let adc = AdcCapture::new(
+        board::I2S_ADC_CHANNEL,
+        hw.adc_attenuation,
+        adc_stats.clone(),
+    );
     let pipe = AudioPipeline::new();
     heap_log("after audio init");
 
@@ -185,11 +194,13 @@ fn main() -> anyhow::Result<()> {
 
     // Audio frame pump on core 1: decoder feed is unmuted (pre-squelch), the
     // squelch mute applies to the stream copy only (audio.h ordering).
+    let audio_level = Arc::new(AudioLevel::default());
     {
         let state_a = state.clone();
         let squelch_a = squelch_open.clone();
         let ring_a = ring.clone();
         let dec_shared_a = dec_shared.clone();
+        let level_a = audio_level.clone();
         let mut adc = adc;
         let mut pipe = pipe;
         // 12 kB stack: audio_task's frame buffers (~2 kB) + the FIR scratch
@@ -200,7 +211,13 @@ fn main() -> anyhow::Result<()> {
                 &mut adc,
                 &mut pipe,
                 &squelch_a,
-                |b48k, b16k| decoder::feed(&dec_shared_a, &dec_tx, b48k, b16k),
+                |b48k, b16k| {
+                    // Sampled here, not in the stream sink: this callback runs
+                    // pre-squelch and regardless of the active protocol, so the
+                    // level stays truthful even with the decoder off.
+                    level_a.update(b16k);
+                    decoder::feed(&dec_shared_a, &dec_tx, b48k, b16k);
+                },
                 |b16k| {
                     // 16 kHz PCM16LE into the /stream.wav broadcast ring.
                     let mut bytes = [0u8; FRAME_SAMPLES_16K * 2];
@@ -250,6 +267,8 @@ fn main() -> anyhow::Result<()> {
         decoder: dec_shared,
         ota_in_progress,
         squelch_open: squelch_open.clone(),
+        audio_level,
+        adc_stats,
         uplink: Arc::new(UplinkStatus::default()),
         ota: Arc::new(OtaStatus::default()),
         wifi_connected: wifi_connected.clone(),
@@ -268,7 +287,7 @@ fn main() -> anyhow::Result<()> {
         state.config.read().unwrap().stream_port
     );
 
-    supervisor_loop(&state, &mut radio, &mut wifi, &squelch_open, &wifi_connected);
+    supervisor_loop(&shared, &mut radio, &mut wifi);
 }
 
 fn heap_log(stage: &str) {
@@ -281,13 +300,10 @@ fn heap_log(stage: &str) {
 /// re-tune on config change, WiFi/mDNS/SNTP upkeep, OTA app-validate and status
 /// logging. Ports the .ino `loop()` and its per-function static state. Never
 /// returns.
-fn supervisor_loop(
-    state: &AppState,
-    radio: &mut Radio<'_>,
-    wifi: &mut WifiManager,
-    squelch_open: &AtomicBool,
-    wifi_connected: &AtomicBool,
-) -> ! {
+fn supervisor_loop(shared: &SharedState, radio: &mut Radio<'_>, wifi: &mut WifiManager) -> ! {
+    let state = &shared.app;
+    let squelch_open = &shared.squelch_open;
+    let wifi_connected = &shared.wifi_connected;
     let hw = state.hw;
 
     // squelchLoop() state.
@@ -303,6 +319,7 @@ fn supervisor_loop(
 
     // statusLoop() state.
     let mut status_last = Instant::now();
+    let mut adc_last_us = unsafe { sys::esp_timer_get_time() };
 
     // Radio re-tune tracking (generation counter bumped on config change).
     let mut applied_radio_gen = 0u32;
@@ -370,17 +387,77 @@ fn supervisor_loop(
         }
 
         // --- status log every 5 s ---
+        // The counters matter as much as the flags: without dec=/up= there is
+        // no way to tell "the radio hears nothing" from "the decoder is off"
+        // from "the uplink can't reach the backend" over USB alone.
         if status_last.elapsed() >= Duration::from_secs(5) {
             status_last = Instant::now();
-            unsafe {
-                log::info!(
-                    "[status] heap={} wifi={} radio={} sq={}",
-                    sys::esp_get_free_heap_size(),
-                    wifi.is_connected() as u8,
-                    radio.found() as u8,
-                    squelch_open.load(Ordering::Relaxed) as u8
-                );
-            }
+
+            let st = &shared.frames.stats;
+            let up_mode = shared
+                .uplink
+                .mode
+                .lock()
+                .map(|m| m.clone())
+                .unwrap_or_default();
+            let up_err = shared
+                .uplink
+                .last_error
+                .lock()
+                .map(|e| e.clone())
+                .unwrap_or_default();
+            let err_field = if up_err.is_empty() {
+                String::new()
+            } else {
+                format!(" err={up_err}")
+            };
+
+            // ADC delivery rate, timed against esp_timer rather than an assumed
+            // 5 s window — the question is whether the true rate is *stable*
+            // (then the DSP can simply be told the truth) or jittery.
+            let adc = &shared.adc_stats;
+            let now_us = unsafe { sys::esp_timer_get_time() };
+            let conv = adc.conversions.swap(0, Ordering::Relaxed);
+            let acc = adc.accepted.swap(0, Ordering::Relaxed);
+            let miss = adc.ch_mismatch.swap(0, Ordering::Relaxed);
+            let to = adc.timeouts.swap(0, Ordering::Relaxed);
+            let dt_us = (now_us - adc_last_us).max(1);
+            adc_last_us = now_us;
+            let hz = (conv as i64 * 1_000_000) / dt_us;
+            log::info!(
+                "[adc] rate={} Hz (want 48000, dt={}us conv={}) acc={} chmiss={} timeouts={} poolovf={} word0=0x{:04X}",
+                hz,
+                dt_us,
+                conv,
+                acc,
+                miss,
+                to,
+                audio::ADC_POOL_OVF.load(Ordering::Relaxed),
+                adc.first_word.load(Ordering::Relaxed),
+            );
+
+            let heap = unsafe { sys::esp_get_free_heap_size() };
+            log::info!(
+                "[status] heap={} wifi={} rssi={} radio={} sq={} lvl={} \
+                 dec={}/{} fdrop={} q={} up={}/{} sent={}/{} drop={} clients={}{}",
+                heap,
+                connected as u8,
+                if connected { wifi::sta_rssi() } else { 0 },
+                radio.found() as u8,
+                squelch_open.load(Ordering::Relaxed) as u8,
+                shared.audio_level.peak(),
+                st.frames.load(Ordering::Relaxed),
+                st.bursts.load(Ordering::Relaxed),
+                shared.decoder.feed_drops.load(Ordering::Relaxed),
+                shared.frames.queued(),
+                up_mode,
+                shared.uplink.connected.load(Ordering::Relaxed) as u8,
+                st.sent.load(Ordering::Relaxed),
+                st.accepted.load(Ordering::Relaxed),
+                st.dropped.load(Ordering::Relaxed),
+                shared.stream_stats.clients.load(Ordering::Relaxed),
+                err_field,
+            );
         }
 
         rt::wdt_reset();

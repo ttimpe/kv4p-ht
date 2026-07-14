@@ -7,6 +7,7 @@
 //! ring is display-only (never persisted to flash).
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -100,6 +101,46 @@ impl FrameRecord {
     }
 }
 
+/// Log one CRC-valid telegram to the console, so reception is verifiable over
+/// USB alone — no WiFi, no browser, no backend. The device has no other way to
+/// show a decoded frame locally: the history ring is only readable over HTTP.
+fn log_frame(r: &FrameRecord) {
+    let mut hex = String::with_capacity(r.raw_len as usize * 2);
+    for b in r.raw_bytes() {
+        let _ = write!(hex, "{b:02X}");
+    }
+
+    // R09 fields, only the ones this telegram type actually carries.
+    let mut fields = String::new();
+    if let Some(v) = r.line {
+        let _ = write!(fields, " line={v}");
+    }
+    if let Some(v) = r.run {
+        let _ = write!(fields, " run={v}");
+    }
+    if let Some(v) = r.meldepunkt {
+        let _ = write!(fields, " mp={v}");
+    }
+    if let Some(v) = r.destination {
+        let _ = write!(fields, " dest={v}");
+    }
+    if let Some(v) = r.route {
+        let _ = write!(fields, " route={v}");
+    }
+    if let Some(v) = r.zuglaenge {
+        let _ = write!(fields, " zl={v}");
+    }
+
+    log::info!(
+        "[tg] {} {} rep={}{} ({})",
+        r.proto_str(),
+        hex,
+        r.repaired_bits,
+        fields,
+        r.label
+    );
+}
+
 /// Shared decode/uplink counters (C `stBursts`..`stAccepted` + last label).
 /// The decoder bumps `bursts`; `frames`/`dropped` are bumped here; the uplink
 /// task (later module) bumps `sent`/`accepted` and `dropped` on send errors.
@@ -153,6 +194,8 @@ impl Frames {
         } else {
             0
         };
+
+        log_frame(&r);
 
         {
             let mut q = self.queue.lock().unwrap();
