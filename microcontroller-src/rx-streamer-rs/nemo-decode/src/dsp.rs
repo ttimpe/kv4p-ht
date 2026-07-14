@@ -1,221 +1,207 @@
-//! Streaming DSP front-end and energy-gated burst capture (48 kHz i16 in).
+//! Streaming front-end and energy-gated burst capture (48 kHz i16 in).
 //!
-//! Physical layer (patent EP 0566773): the FM baseband carries AMI-coded cos^2
-//! half-wave pulses of a ~2400 Hz tone at 4800 Bd (mark = pulse, space = gap).
-//! Per-sample chain, faithful to `decoder_nemo.h` `nemoFeed`, which ports
-//! `bast_chain.py demod()`:
+//! Port of the receive chain in `lio-decoder/src/nemo_hysteresis_demod.py`
+//! (`detect_pulses`'s preamble): DC/baseline block, then a low-pass to the data
+//! corner — and **no rectification**. The signal that reaches the burst buffer is
+//! still bipolar, because polarity is the line code (AMI): the previous
+//! front-end's `abs()` threw away exactly the information the demodulator needs.
 //!
-//!   x - moving_avg(x, 200) -> |x| -> freq-xlate @2400 Hz + 43-tap FIR
-//!   -> decimate by 2 -> |z| -> moving_avg(5)  => envelope @ 24 kHz
+//! Chain, per 48 kHz sample:
 //!
-//! Bursts are gated by an adaptive energy detector (same shape as the FFSK
-//! squelch) into a heap-allocated envelope buffer, with preroll / hold / min-burst
-//! exactly as the C.
+//! ```text
+//!   x - moving_avg(x, 4 ms)      DC / baseline block
+//!   -> Butterworth LP, 3400 Hz   receiveDigitalFilter / upperCornerFrequencyRxData
+//!   -> decimate by 2             => bipolar signal @ 24 kHz, stored as i16
+//! ```
+//!
+//! The low-pass is **causal** (a biquad cascade), where the reference uses a
+//! zero-phase `filtfilt`. That is deliberate: `filtfilt` needs the whole burst
+//! as f32 (~36 kB for a 375 ms burst), and the node has ~25-47 kB of heap free
+//! with the decoder running. A causal filter costs a constant group delay, and
+//! the demodulator measures only *gaps between* pulses (per-pulse resync), so a
+//! constant delay cancels exactly.
+//!
+//! It also serves as the anti-alias filter for the 48->24 kHz decimation: at
+//! 3.4 kHz corner nothing survives near the 12 kHz Nyquist.
 
-use crate::{
-    NEMO_DC_LEN, NEMO_ENV_MAX, NEMO_FS, NEMO_HOLD_ENV, NEMO_MIN_BURST, NEMO_NCO_LEN, NEMO_PRE_ENV,
-    NEMO_XL_CUTOFF, NEMO_XL_TAPS,
-};
+use crate::{NEMO_DC_LEN, NEMO_FS, NEMO_HOLD, NEMO_LP_CORNER, NEMO_MIN_BURST, NEMO_PRE, NEMO_SIG_MAX};
+
+/// Direct-form-I biquad.
+#[derive(Default, Clone, Copy)]
+struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl Biquad {
+    /// RBJ low-pass section at `f0` with quality `q`.
+    fn lowpass(fs: f32, f0: f32, q: f32) -> Biquad {
+        let w0 = 2.0 * core::f32::consts::PI * f0 / fs;
+        let (sin_w0, cos_w0) = (w0.sin(), w0.cos());
+        let alpha = sin_w0 / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        Biquad {
+            b0: ((1.0 - cos_w0) / 2.0) / a0,
+            b1: (1.0 - cos_w0) / a0,
+            b2: ((1.0 - cos_w0) / 2.0) / a0,
+            a1: (-2.0 * cos_w0) / a0,
+            a2: (1.0 - alpha) / a0,
+            ..Default::default()
+        }
+    }
+
+    fn run(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2 - self.a1 * self.y1
+            - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+}
 
 pub(crate) struct Frontend {
-    // DC removal (sliding sum) on the raw 48 kHz samples.
+    // DC / baseline removal (sliding sum) on the raw 48 kHz samples.
     dc_sum: i32,
     dc_hist: [i16; NEMO_DC_LEN],
     dc_pos: usize,
-    // NCO mix + FIR history (complex), consumed at the decimated rate.
-    nco_cos: [f32; NEMO_NCO_LEN],
-    nco_sin: [f32; NEMO_NCO_LEN],
-    nco_phase: usize,
-    taps: [f32; NEMO_XL_TAPS],
-    xr: [f32; NEMO_XL_TAPS],
-    xi: [f32; NEMO_XL_TAPS],
-    x_pos: usize,
-    decim_phase: i32,
-    // moving_avg(5) on the magnitude.
-    ma5: [f32; 5],
-    ma5_sum: f32,
-    ma5_pos: usize,
-    // burst gate (normalized envelope, adaptive floor like the FFSK squelch).
-    act_env: f32,
+    // 4th-order Butterworth low-pass = two biquads (Q = 0.5412, 1.3066).
+    lp1: Biquad,
+    lp2: Biquad,
+    decim_phase: u8,
+
+    // Burst gate on |y|, with an adaptive noise floor (same shape as the FFSK
+    // squelch): a burst opens at 4x the floor and closes after HOLD below it.
+    act: f32,
     act_alpha: f32,
-    act_floor: f32,
+    floor: f32,
     floor_rise: f32,
     floor_fall: f32,
     bursting: bool,
-    below_count: i32,
-    // envelope capture.
-    pre_ring: [i16; NEMO_PRE_ENV],
+    below: i32,
+
+    // Preroll, so the gate's own attack does not clip the first pulses.
+    pre_ring: [i16; NEMO_PRE],
     pre_pos: usize,
     pre_fill: usize,
-    /// ~18 kB envelope buffer, heap-allocated (mirrors the C's lazy alloc).
-    pub(crate) env: Box<[i16]>,
-    env_len: usize,
+
+    /// Bipolar burst signal @ 24 kHz. Public to the crate: the demodulator reads
+    /// it in place, so a burst is never copied.
+    pub(crate) sig: Box<[i16]>,
+    pub(crate) sig_len: usize,
 }
 
 impl Frontend {
     pub(crate) fn new() -> Self {
-        let mut nco_cos = [0.0f32; NEMO_NCO_LEN];
-        let mut nco_sin = [0.0f32; NEMO_NCO_LEN];
-        for k in 0..NEMO_NCO_LEN {
-            let a = -2.0 * std::f32::consts::PI * k as f32 / NEMO_NCO_LEN as f32;
-            nco_cos[k] = a.cos();
-            nco_sin[k] = a.sin();
-        }
-        // windowed-sinc (Hamming) low-pass like scipy.signal.firwin, unity DC gain.
-        let fc = NEMO_XL_CUTOFF / NEMO_FS;
-        let mut taps = [0.0f32; NEMO_XL_TAPS];
-        let mut sum = 0.0f32;
-        for k in 0..NEMO_XL_TAPS {
-            let m = k as f32 - (NEMO_XL_TAPS as f32 - 1.0) / 2.0;
-            let sinc = if m == 0.0 {
-                2.0 * fc
-            } else {
-                (2.0 * std::f32::consts::PI * fc * m).sin() / (std::f32::consts::PI * m)
-            };
-            let w = 0.54 - 0.46 * (2.0 * std::f32::consts::PI * k as f32 / (NEMO_XL_TAPS as f32 - 1.0)).cos();
-            taps[k] = sinc * w;
-            sum += taps[k];
-        }
-        for k in 0..NEMO_XL_TAPS {
-            taps[k] /= sum;
-        }
-        let fs2 = NEMO_FS / 2.0; // 24 kHz envelope rate
+        let fs2 = NEMO_FS / 2.0; // 24 kHz, the rate the gate runs at
         Frontend {
             dc_sum: 0,
             dc_hist: [0; NEMO_DC_LEN],
             dc_pos: 0,
-            nco_cos,
-            nco_sin,
-            nco_phase: 0,
-            taps,
-            xr: [0.0; NEMO_XL_TAPS],
-            xi: [0.0; NEMO_XL_TAPS],
-            x_pos: 0,
+            // Butterworth order 4 = cascade of two sections at these Qs.
+            lp1: Biquad::lowpass(NEMO_FS, NEMO_LP_CORNER, 0.541_196),
+            lp2: Biquad::lowpass(NEMO_FS, NEMO_LP_CORNER, 1.306_563),
             decim_phase: 0,
-            ma5: [0.0; 5],
-            ma5_sum: 0.0,
-            ma5_pos: 0,
-            act_env: 0.0,
-            act_alpha: 1.0 - (-1.0 / (fs2 * 0.005)).exp(),
-            act_floor: 0.05,
-            floor_rise: 1.0 - (-1.0 / (fs2 * 5.0)).exp(),
-            floor_fall: 1.0 - (-1.0 / (fs2 * 0.05)).exp(),
+            act: 0.0,
+            act_alpha: 1.0 - (-1.0f32 / (fs2 * 0.002)).exp(),
+            floor: 0.05,
+            floor_rise: 1.0 - (-1.0f32 / (fs2 * 5.0)).exp(),
+            floor_fall: 1.0 - (-1.0f32 / (fs2 * 0.05)).exp(),
             bursting: false,
-            below_count: 0,
-            pre_ring: [0; NEMO_PRE_ENV],
+            below: 0,
+            pre_ring: [0; NEMO_PRE],
             pre_pos: 0,
             pre_fill: 0,
-            env: vec![0i16; NEMO_ENV_MAX].into_boxed_slice(),
-            env_len: 0,
+            sig: vec![0i16; NEMO_SIG_MAX].into_boxed_slice(),
+            sig_len: 0,
         }
     }
 
     /// Push one raw 48 kHz sample. Returns `Some(len)` when a burst has just
-    /// finalized and is ready for decoding in `self.env[..len]`.
+    /// finalized and is ready to demodulate in `self.sig[..len]`.
     pub(crate) fn push(&mut self, x: i16) -> Option<usize> {
+        // DC / baseline block (reference: x - moving_avg(x, 4 ms)).
         self.dc_sum += x as i32 - self.dc_hist[self.dc_pos] as i32;
         self.dc_hist[self.dc_pos] = x;
         self.dc_pos = (self.dc_pos + 1) % NEMO_DC_LEN;
         let dc = x as f32 - self.dc_sum as f32 / NEMO_DC_LEN as f32;
-        let y = dc.abs();
 
-        let c = self.nco_cos[self.nco_phase];
-        let s = self.nco_sin[self.nco_phase];
-        self.nco_phase = (self.nco_phase + 1) % NEMO_NCO_LEN;
-        self.xr[self.x_pos] = y * c;
-        self.xi[self.x_pos] = y * s;
-        self.x_pos = (self.x_pos + 1) % NEMO_XL_TAPS;
+        // Low-pass to the data corner. NOT rectified: AMI polarity is the code.
+        let y = self.lp2.run(self.lp1.run(dc));
 
-        self.decim_phase += 1;
-        if self.decim_phase < 2 {
+        self.decim_phase ^= 1;
+        if self.decim_phase == 1 {
             return None; // 48 kHz -> 24 kHz
         }
-        self.decim_phase = 0;
 
-        let mut zr = 0.0f32;
-        let mut zi = 0.0f32;
-        let base = self.x_pos + NEMO_XL_TAPS - 1;
-        for k in 0..NEMO_XL_TAPS {
-            let mut idx = base - k;
-            if idx >= NEMO_XL_TAPS {
-                idx -= NEMO_XL_TAPS;
-            }
-            zr += self.taps[k] * self.xr[idx];
-            zi += self.taps[k] * self.xi[idx];
-        }
-        let mag = (zr * zr + zi * zi).sqrt();
+        let q: i16 = y.clamp(-32768.0, 32767.0) as i16;
 
-        self.ma5_sum += mag - self.ma5[self.ma5_pos];
-        self.ma5[self.ma5_pos] = mag;
-        self.ma5_pos = (self.ma5_pos + 1) % 5;
-        let env = self.ma5_sum / 5.0;
-        let env_q: i16 = if env > 32767.0 { 32767 } else { env as i16 };
-
-        // burst gate on the normalized envelope
-        let norm = env / 32768.0;
-        self.act_env += (norm - self.act_env) * self.act_alpha;
-        let alpha = if self.act_env < self.act_floor {
+        // Gate on the rectified *envelope* — rectifying is fine here, because
+        // this only decides where a burst starts and ends; the stored signal
+        // stays bipolar.
+        let norm = y.abs() / 32768.0;
+        self.act += (norm - self.act) * self.act_alpha;
+        let alpha = if self.act < self.floor {
             self.floor_fall
         } else {
             self.floor_rise
         };
-        self.act_floor += (self.act_env - self.act_floor) * alpha;
-        if self.act_floor < 1e-5 {
-            self.act_floor = 1e-5;
+        self.floor += (self.act - self.floor) * alpha;
+        if self.floor < 1e-5 {
+            self.floor = 1e-5;
         }
 
         if !self.bursting {
-            self.pre_ring[self.pre_pos] = env_q;
-            self.pre_pos = (self.pre_pos + 1) % NEMO_PRE_ENV;
-            if self.pre_fill < NEMO_PRE_ENV {
+            self.pre_ring[self.pre_pos] = q;
+            self.pre_pos = (self.pre_pos + 1) % NEMO_PRE;
+            if self.pre_fill < NEMO_PRE {
                 self.pre_fill += 1;
             }
-            if self.act_env > self.act_floor * 4.0 {
+            if self.act > self.floor * 4.0 {
+                // Open: replay the preroll so the burst's first pulses survive.
                 self.bursting = true;
-                self.below_count = 0;
-                self.env_len = 0;
-                let mut k = self.pre_fill as isize;
-                while k > 0 {
-                    let mut idx = self.pre_pos as isize - k;
-                    if idx < 0 {
-                        idx += NEMO_PRE_ENV as isize;
-                    }
-                    self.env[self.env_len] = self.pre_ring[idx as usize];
-                    self.env_len += 1;
-                    k -= 1;
+                self.below = 0;
+                self.sig_len = 0;
+                let start = (self.pre_pos + NEMO_PRE - self.pre_fill) % NEMO_PRE;
+                for k in 0..self.pre_fill {
+                    self.sig[self.sig_len] = self.pre_ring[(start + k) % NEMO_PRE];
+                    self.sig_len += 1;
                 }
             }
             return None;
         }
 
-        self.env[self.env_len] = env_q;
-        self.env_len += 1;
-        let mut finalize = false;
-        if self.act_env < self.act_floor * 2.0 {
-            self.below_count += 1;
-            if self.below_count >= NEMO_HOLD_ENV {
-                finalize = true;
-            }
-        } else {
-            self.below_count = 0;
-        }
-        if self.env_len >= NEMO_ENV_MAX {
-            finalize = true; // buffer full: decode what we have
+        if self.sig_len < NEMO_SIG_MAX {
+            self.sig[self.sig_len] = q;
+            self.sig_len += 1;
         }
 
-        if finalize {
-            let keep_bursting = self.env_len >= NEMO_ENV_MAX && self.below_count < NEMO_HOLD_ENV;
-            let ready = if self.env_len >= NEMO_MIN_BURST {
-                Some(self.env_len)
-            } else {
-                None
-            };
-            self.env_len = 0;
-            self.bursting = keep_bursting;
-            self.below_count = 0;
+        if self.act < self.floor * 2.0 {
+            self.below += 1;
+        } else {
+            self.below = 0;
+        }
+
+        let full = self.sig_len >= NEMO_SIG_MAX;
+        if self.below >= NEMO_HOLD || full {
+            self.bursting = false;
             self.pre_fill = 0;
-            self.pre_pos = 0;
-            return ready;
+            let len = self.sig_len;
+            self.sig_len = 0;
+            // A real telegram is >= ~12 ms on air. The old front-end demanded
+            // 80 ms, which discarded every single-telegram burst before it was
+            // ever decoded — the reason this decoder never saw a real frame.
+            if len >= NEMO_MIN_BURST {
+                return Some(len);
+            }
         }
         None
     }

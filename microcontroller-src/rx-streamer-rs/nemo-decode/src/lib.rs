@@ -1,21 +1,27 @@
 //! NEMO / VicosLio ("G2") telegram decoder — a host-portable, dependency-free
-//! Rust port of the on-device C decoder (`kv4p_rx_streamer/decoder_nemo.h`),
-//! itself a best-effort port of the validated on-air chain in `lio-decoder`
-//! (`src/bast_chain.py` `demod()` front-end, `clock_recovery_mm`, and the HDLC
-//! framing + CRC acceptance from `frames()` / `decode_air.py extract_frames()`).
+//! Rust port of the **validated** on-air chain in `lio-decoder`
+//! (`src/nemo_hysteresis_demod.py` front-end + `src/decode_air.py` framing/CRC).
 //!
-//! Physical layer (patent EP 0566773): the FM baseband carries AMI-coded cos^2
-//! half-wave pulses of a ~2400 Hz tone at 4800 Bd (mark = pulse, space = gap).
-//! Front-end (streaming, 48 kHz in):
+//! Physical layer (patent EP 0566773 B1): the FM baseband carries AMI-coded
+//! cos^2 half-wave pulses of a ~2400 Hz tone (mark = pulse, space = gap), with
+//! the polarity of every mark alternating. Real captures run the tone near
+//! 2213 Hz, i.e. ~4427 Bd — **not** the nominal 2400/4800.
+//!
+//! Front-end (streaming, 48 kHz in) — the vehicle DSP's own receive path,
+//! reverse-engineered from its firmware (`rpsL2aL1.c`):
 //!
 //! ```text
-//!   x - moving_avg(x,200) -> |x| -> freq-xlate @2400 Hz + 43-tap FIR,
-//!   decimate by 2 -> |z| -> moving_avg(5)  => envelope @ 24 kHz
+//!   x - moving_avg(x, 4 ms)        DC / baseline block
+//!   -> Butterworth LP 3400 Hz      (BIPOLAR — no rectification: polarity is the code)
+//!   -> decimate by 2               => signal @ 24 kHz
+//!   -> energy gate                 => burst
 //! ```
 //!
-//! Bursts are gated by an adaptive energy detector into a buffer; on burst end:
-//! approximate-median bias removal -> Mueller & Müller clock recovery (sps=5) ->
-//! HDLC deframe (EOF = run of six 1s, destuff, byte-offset sweep) -> CRC.
+//! Per burst: signed Schmitt comparator (the firmware's `receiveTriggerLevel` +/-
+//! `receiveHysteresis`) -> pulses; baud estimated from the dominant tone;
+//! per-pulse-resync symbol decode (patent claim 2: the symbol clock is reset on
+//! every pulse) -> bits; HDLC deframe (EOF = run of six 1s, destuff, byte-offset
+//! sweep) -> CRC.
 //!
 //! Two CRC conventions close on real captures (verified against the Python
 //! references): LSB-first bytes + X.25 FCS (LE trailer) — what the backend
@@ -23,18 +29,33 @@
 //! `decode_air.py` `(init, xorout)` variants. Both are accepted; a caller (or
 //! the server's `crc_ok`) decides what drives the map.
 //!
-//! # Fidelity
+//! # History: why the front-end was replaced
 //!
-//! This is a 1:1 numeric port of the C: identical integer/f32 types, constants,
-//! thresholds, and processing order, so behavior is bit-comparable with the
-//! firmware. The one intentional deviation (shared with the C) is the burst
-//! median, computed via a 256-bin histogram rather than an exact sort.
+//! This crate previously ported `bast_chain.py`, which rectified the signal
+//! (destroying AMI polarity), recovered the clock with Mueller & Müller (whose
+//! timing error accumulates across a telegram's long zero-runs), assumed exactly
+//! 4800 Bd, and gated out any burst under 80 ms — longer than a whole telegram.
+//! It decoded a synthesized fixture and, as its own test admitted, **never a real
+//! capture**. On air it produced bursts and zero frames. The chain above is the
+//! one that closes CRCs on real data.
+//!
+//! # Deviations from the Python reference
+//!
+//! Both are forced by the node's budget (~25-47 kB free heap, 240 MHz), and
+//! neither changes the algorithm:
+//!
+//! * The low-pass is **causal** (biquad cascade) where the reference uses a
+//!   zero-phase `filtfilt`. `filtfilt` needs the whole burst as f32; a causal
+//!   filter costs a constant group delay, and per-pulse resync measures only
+//!   gaps *between* pulses, so a constant delay cancels.
+//! * The burst's 99th-percentile amplitude and the tone search use a 256-bin
+//!   histogram and a Goertzel sweep instead of an exact percentile and an FFT.
 //!
 //! # Scope
 //!
-//! This crate covers exactly what `decoder_nemo.h` covers: the DSP front-end,
-//! burst capture, clock recovery, HDLC deframing, and dual-CRC acceptance.
-//! Caller-side responsibilities are deliberately left out:
+//! This crate covers the DSP front-end, burst capture, demodulation, HDLC
+//! deframing, and dual-CRC acceptance. Caller-side responsibilities are
+//! deliberately left out:
 //!
 //! * **Within-burst dedup.** [`NemoDecoder::feed`] returns every frame the
 //!   offset/polarity sweep accepts, so the same telegram can appear more than
@@ -44,7 +65,7 @@
 //! * **Frame labelling / enqueue / upload.** The firmware builds a
 //!   `g2.<byte3> <len>B <how>` label and enqueues; that is left to the caller.
 
-mod clock;
+mod demod;
 mod dsp;
 mod hdlc;
 
@@ -53,20 +74,30 @@ pub use crc::CrcConvention;
 
 use dsp::Frontend;
 
-// --- constants (mirrors the NEMO_* macros in decoder_nemo.h) ---
+// --- constants ---
 
-pub(crate) const NEMO_FS: f32 = 48000.0;
-pub(crate) const NEMO_DC_LEN: usize = 200; // moving-average DC removal window @48k
-pub(crate) const NEMO_XL_TAPS: usize = 43; // firwin(43, 4000/(fs/2)) — cutoff is load-bearing
-pub(crate) const NEMO_XL_CUTOFF: f32 = 4000.0;
-pub(crate) const NEMO_NCO_LEN: usize = 20; // 2400/48000 = 1/20: the NCO cycles in 20 steps
-pub(crate) const NEMO_SPS: f32 = 5.0; // 24000 / 4800
+pub(crate) const NEMO_FS: f32 = 48000.0; // input rate
+pub(crate) const NEMO_FS2: f32 = 24000.0; // after decimation — the rate everything below runs at
+pub(crate) const NEMO_DC_LEN: usize = 200; // moving-average DC block @48k (~4.2 ms; reference: 4 ms)
+pub(crate) const NEMO_LP_CORNER: f32 = 3400.0; // upperCornerFrequencyRxData
 
-pub(crate) const NEMO_ENV_MAX: usize = 9000; // 375 ms of 24 kHz envelope (int16) = 18 kB
-pub(crate) const NEMO_PRE_ENV: usize = 256; // ~10.7 ms preroll kept before gate-open
+/// Plausible baud range. Real captures sit near 4427 Bd (a ~2213 Hz tone); the
+/// nominal rate is 4800. Anything outside this is a mis-estimate, not a burst.
+pub(crate) const NEMO_BAUD_MIN: f32 = 3600.0;
+pub(crate) const NEMO_BAUD_MAX: f32 = 5400.0;
+
+pub(crate) const NEMO_SIG_MAX: usize = 9000; // 375 ms of 24 kHz bipolar signal (int16) = 18 kB
+pub(crate) const NEMO_PRE: usize = 256; // ~10.7 ms preroll kept before gate-open
 pub(crate) const NEMO_MAX_BITS: usize = 2048;
-pub(crate) const NEMO_MIN_BURST: usize = 1920; // 80 ms @ 24 kHz, like the reference pipeline
-pub(crate) const NEMO_HOLD_ENV: i32 = 480; // 20 ms sustained-below before the gate closes
+
+/// Shortest burst worth decoding: ~10 ms @ 24 kHz.
+///
+/// The old front-end demanded 1920 (80 ms) "like the reference pipeline" — but a
+/// whole telegram is only ~12-35 ms on air, so that threshold threw away every
+/// real single-telegram burst before decoding it. That single constant is why
+/// this decoder reported bursts and never a frame.
+pub(crate) const NEMO_MIN_BURST: usize = 240;
+pub(crate) const NEMO_HOLD: i32 = 480; // 20 ms sustained-below before the gate closes
 pub(crate) const NEMO_FRAME_MAX: usize = 32;
 pub(crate) const NEMO_MIN_SEG: usize = 16; // bits; decode_air extract_frames min_seg
 
@@ -92,6 +123,7 @@ pub struct NemoDecoder {
     front: Frontend,
     bits: Box<[u8]>,
     scratch: Box<[u8]>,
+    pulses: Vec<demod::Pulse>,
     bursts: u64,
 }
 
@@ -102,6 +134,7 @@ impl NemoDecoder {
             front: Frontend::new(),
             bits: vec![0u8; NEMO_MAX_BITS].into_boxed_slice(),
             scratch: vec![0u8; NEMO_MAX_BITS].into_boxed_slice(),
+            pulses: Vec::with_capacity(512),
             bursts: 0,
         }
     }
@@ -133,9 +166,14 @@ impl NemoDecoder {
     }
 
     fn process_burst(&mut self, len: usize, out: &mut Vec<NemoFrame>) {
-        let env = &self.front.env[..len];
-        let median = clock::median(env);
-        let nbits = clock::clock_recover(env, median, &mut self.bits);
+        let sig = &self.front.sig[..len];
+        // Schmitt comparator -> pulses; tone -> baud; per-pulse resync -> bits.
+        demod::detect_pulses(sig, 0.4, &mut self.pulses);
+        if self.pulses.len() < 4 {
+            return;
+        }
+        let baud = demod::estimate_baud(sig);
+        let nbits = demod::bits_from_pulses(&self.pulses, baud, &mut self.bits);
         if nbits < NEMO_MIN_SEG {
             return;
         }
