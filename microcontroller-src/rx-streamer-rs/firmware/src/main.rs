@@ -15,6 +15,7 @@ mod audio;
 mod board;
 mod broadcast_ring;
 mod config;
+mod control;
 mod decoder;
 mod frames;
 mod ota;
@@ -26,7 +27,7 @@ mod web;
 mod wifi;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -158,12 +159,14 @@ fn main() -> anyhow::Result<()> {
         None::<AnyIOPin>,
         &ucfg,
     )?;
-    let mut radio = Radio::new(uart, hw.rf_module_type);
+    // Behind a mutex: the supervisor loop re-tunes it, and the RSSI poll task
+    // queries it several times a second. Both hold the lock for one command.
+    let radio = Arc::new(Mutex::new(Radio::new(uart, hw.rf_module_type)));
     heap_log("boot");
     {
         let cfg = state.config.read().unwrap();
         let ch = state.channels.read().unwrap();
-        radio.init(&cfg, &ch);
+        radio.lock().unwrap().init(&cfg, &ch);
     }
     heap_log("after radio init");
 
@@ -280,6 +283,9 @@ fn main() -> anyhow::Result<()> {
     uplink::start(shared.clone())?;
     ota::start(shared.clone())?;
     let _web = web::start(shared.clone())?;
+    // RF signal level: polls the SA818 and peak-holds into shared.frames, where
+    // the decoder stamps it onto each telegram it hands the uplink.
+    radio::start_rssi(radio.clone(), shared.frames.clone())?;
     heap_log("after phase-3 start");
 
     log::info!(
@@ -287,7 +293,7 @@ fn main() -> anyhow::Result<()> {
         state.config.read().unwrap().stream_port
     );
 
-    supervisor_loop(&shared, &mut radio, &mut wifi);
+    supervisor_loop(&shared, &radio, &mut wifi);
 }
 
 fn heap_log(stage: &str) {
@@ -300,7 +306,11 @@ fn heap_log(stage: &str) {
 /// re-tune on config change, WiFi/mDNS/SNTP upkeep, OTA app-validate and status
 /// logging. Ports the .ino `loop()` and its per-function static state. Never
 /// returns.
-fn supervisor_loop(shared: &SharedState, radio: &mut Radio<'_>, wifi: &mut WifiManager) -> ! {
+fn supervisor_loop(
+    shared: &SharedState,
+    radio: &Arc<Mutex<Radio<'static>>>,
+    wifi: &mut WifiManager,
+) -> ! {
     let state = &shared.app;
     let squelch_open = &shared.squelch_open;
     let wifi_connected = &shared.wifi_connected;
@@ -364,8 +374,10 @@ fn supervisor_loop(shared: &SharedState, radio: &mut Radio<'_>, wifi: &mut WifiM
         let g = state.gen.radio.load(Ordering::SeqCst);
         if g != applied_radio_gen {
             applied_radio_gen = g;
-            if let (Ok(cfg), Ok(ch)) = (state.config.read(), state.channels.read()) {
-                radio.apply_tuning(&cfg, &ch);
+            if let (Ok(cfg), Ok(ch), Ok(mut r)) =
+                (state.config.read(), state.channels.read(), radio.lock())
+            {
+                r.apply_tuning(&cfg, &ch);
             }
         }
 
@@ -443,7 +455,9 @@ fn supervisor_loop(shared: &SharedState, radio: &mut Radio<'_>, wifi: &mut WifiM
                 heap,
                 connected as u8,
                 if connected { wifi::sta_rssi() } else { 0 },
-                radio.found() as u8,
+                // The static flag, not radio.found(): the status log must not
+                // contend with the RSSI poll task for the radio mutex.
+                radio::module_found() as u8,
                 squelch_open.load(Ordering::Relaxed) as u8,
                 shared.audio_level.peak(),
                 st.frames.load(Ordering::Relaxed),

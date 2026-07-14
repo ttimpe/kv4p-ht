@@ -195,7 +195,11 @@ fn process_ffsk(f: &mut FfskState, buf: &[i16], repairer: &Repairer, frames: &Fr
         };
         if let Some(burst) = burst {
             frames.stats.bursts.fetch_add(1, Ordering::Relaxed);
-            decode_ffsk_burst(&burst.bits, repairer, frames);
+            // Consume the peak level once per burst, not once per record: a
+            // burst can yield several hits, and they all describe the same
+            // transmission, so they must all carry the same signal level.
+            let rssi = frames.rssi.take_peak();
+            decode_ffsk_burst(&burst.bits, repairer, frames, rssi);
         }
     }
 }
@@ -215,7 +219,7 @@ struct FfskHit {
 /// bit offset and length is tried, `parse_frame` applies CRC/repair and the
 /// structural acceptance rules, and overlapping hits are deduped on their raw
 /// bytes keeping the least-repaired instance.
-fn decode_ffsk_burst(bits: &[u8], repairer: &Repairer, frames: &Frames) {
+fn decode_ffsk_burst(bits: &[u8], repairer: &Repairer, frames: &Frames, rssi: Option<u8>) {
     let mut found: Vec<FfskHit> = Vec::new();
 
     for offset in 0..3usize {
@@ -263,7 +267,9 @@ fn decode_ffsk_burst(bits: &[u8], repairer: &Repairer, frames: &Frames) {
     }
 
     for hit in found {
-        frames.enqueue(ffsk_record(&hit));
+        let mut r = ffsk_record(&hit);
+        r.rssi = rssi;
+        frames.enqueue(r);
     }
 }
 
@@ -351,6 +357,9 @@ fn process_nemo(dec: &mut NemoDecoder, buf: &[i16], frames: &Frames) {
         return;
     }
 
+    // One level for every record out of this call — see process_ffsk.
+    let rssi = frames.rssi.take_peak();
+
     // Within-burst dedup by byte content, up to NEMO_SEEN_MAX distinct frames
     // (the offset/polarity sweep can accept the same telegram twice).
     let mut seen: Vec<&[u8]> = Vec::with_capacity(NEMO_SEEN_MAX);
@@ -370,6 +379,7 @@ fn process_nemo(dec: &mut NemoDecoder, buf: &[i16], frames: &Frames) {
             f.bytes.len(),
             f.crc.as_str()
         );
+        r.rssi = rssi;
         frames.enqueue(r);
     }
 }

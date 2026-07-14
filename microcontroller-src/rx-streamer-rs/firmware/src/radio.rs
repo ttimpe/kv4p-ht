@@ -17,6 +17,7 @@
 //! marked absent rather than left shaping the audio.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use esp_idf_svc::hal::uart::UartDriver;
@@ -24,6 +25,7 @@ use esp_idf_svc::sys;
 
 use crate::board::RfModuleType;
 use crate::config::{self, ChannelTable, Config};
+use crate::frames::Frames;
 
 /// Mirror of the C `radioModuleFound` global. The `Radio` itself lives on the
 /// supervisor loop (not `Arc`-shared), so this static lets the web status
@@ -48,6 +50,19 @@ const VOLUME_MAX: u8 = 8;
 const VOLUME_MIN: u8 = 1;
 const RESPONSE_TIMEOUT_MS: u64 = 2000; // DRA818 TIMEOUT
 const HANDSHAKE_REPEAT: u8 = 3;
+
+/// RSSI reads get a much tighter bound than the 2 s command timeout: they run
+/// several times a second, so a non-answering module must fail fast.
+const RSSI_TIMEOUT_MS: u64 = 50;
+/// Poll period. A VDV R09 telegram lasts only ~60 ms, so this has to be well
+/// under that to land a sample *inside* the burst rather than in the silence
+/// after it. One poll costs ~18 ms of wire time at 9600 baud (7-byte query +
+/// 10-byte reply), so 30 ms keeps the UART ~60% busy — the ceiling before
+/// tuning commands start queueing behind RSSI traffic.
+const RSSI_PERIOD_MS: u64 = 30;
+/// Consecutive silent polls after which we conclude the module has no `RSSI?`
+/// and stop asking (otherwise every poll burns RSSI_TIMEOUT_MS, forever).
+const RSSI_MAX_FAILURES: u32 = 10;
 
 fn wdt_reset() {
     // Best-effort; no-op if the calling task isn't subscribed to the WDT.
@@ -78,10 +93,6 @@ impl<'d> Radio<'d> {
             applied_squelch: 0xFF,
             applied_volume: 0xFF,
         }
-    }
-
-    pub fn found(&self) -> bool {
-        self.found
     }
 
     fn send(&self, bytes: &[u8]) {
@@ -119,6 +130,46 @@ impl<'d> Radio<'d> {
             }
         }
         win[0] == b'0'
+    }
+
+    /// Read one CRLF-terminated line, bounded by `timeout_ms`. Sibling of
+    /// [`Self::read_response`], which throws the payload away and returns only
+    /// success/fail — exactly the DRA818-library shortcoming the C firmware
+    /// complains about and works around (`kv4p_ht_esp32_wroom_32.ino:512`).
+    fn read_line(&self, timeout_ms: u64) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut line = Vec::with_capacity(16);
+        while Instant::now() < deadline {
+            let mut b = [0u8; 1];
+            if let Ok(1) = self.uart.read(&mut b, 1) {
+                match b[0] {
+                    b'\n' => return Some(String::from_utf8_lossy(&line).trim().to_string()),
+                    b'\r' => {}
+                    c => {
+                        if line.len() < 32 {
+                            line.push(c);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Current RF signal level, raw SA818 units **0-255 (not dBm)**.
+    ///
+    /// `None` when the module does not answer: `RSSI?` is an SA818/SA868
+    /// command, and a genuine DRA818 simply has no such thing. The caller must
+    /// back off on repeated `None`s rather than keep burning the timeout —
+    /// see [`rssi_task`].
+    ///
+    /// Bare `RSSI?`, no `AT+` prefix, reply `RSSI=<n>` (C `.ino:515-521`).
+    pub fn read_rssi(&self) -> Option<u8> {
+        self.drain();
+        self.send(b"RSSI?\r\n");
+        let line = self.read_line(RSSI_TIMEOUT_MS)?;
+        let digits = line.strip_prefix("RSSI=")?;
+        digits.trim().parse::<u8>().ok()
     }
 
     fn handshake(&self) -> bool {
@@ -277,5 +328,62 @@ impl<'d> Radio<'d> {
             }
         }
         true
+    }
+}
+
+/// Spawn the RSSI poll task (core 0, small stack, priority 1).
+///
+/// Deliberately its own task rather than a few lines in the supervisor loop: the
+/// read is a blocking UART round-trip several times a second, and the supervisor
+/// is watchdog-subscribed (and owes the squelch a 30 ms debounce). It shares the
+/// radio with the supervisor's `apply_tuning()` through the mutex; both hold it
+/// only for the length of one command.
+///
+/// Samples land in [`Frames::rssi`], which the decoder drains per burst.
+pub fn start_rssi(
+    radio: Arc<Mutex<Radio<'static>>>,
+    frames: Arc<Frames>,
+) -> std::io::Result<()> {
+    crate::rt::spawn(
+        b"rssi\0",
+        3072,
+        1,
+        esp_idf_svc::hal::cpu::Core::Core0,
+        move || rssi_task(radio, frames),
+    )
+    .map(|_| ())
+}
+
+fn rssi_task(radio: Arc<Mutex<Radio<'static>>>, frames: Arc<Frames>) {
+    let mut failures = 0u32;
+    loop {
+        std::thread::sleep(Duration::from_millis(RSSI_PERIOD_MS));
+
+        if frames.rssi.unsupported.load(Ordering::Relaxed) || !module_found() {
+            continue;
+        }
+
+        // Lock scope kept to the single command — apply_tuning() contends here.
+        let sample = match radio.lock() {
+            Ok(r) => r.read_rssi(),
+            Err(_) => continue,
+        };
+
+        match sample {
+            Some(v) => {
+                failures = 0;
+                frames.rssi.observe(v);
+            }
+            None => {
+                failures += 1;
+                if failures >= RSSI_MAX_FAILURES {
+                    frames.rssi.unsupported.store(true, Ordering::Relaxed);
+                    log::warn!(
+                        "[radio] module does not answer RSSI? ({RSSI_MAX_FAILURES} tries) \
+                         — signal level disabled"
+                    );
+                }
+            }
+        }
     }
 }

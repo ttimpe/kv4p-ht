@@ -14,7 +14,7 @@
 //! plus a condvar let a settings save wake the task immediately instead of
 //! leaving it asleep for up to 30 s (C `xTaskNotifyGive`).
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -41,6 +41,10 @@ pub struct OtaStatus {
     pub pending_build: AtomicU32,
     /// `uptime_ms` deadline for the jittered apply (C `otaApplyAtMs`).
     pub apply_at_ms: AtomicU32,
+    /// Set by the backend's `update_now` command: check the manifest regardless
+    /// of the interval and apply a newer build immediately, skipping the
+    /// fleet-staggering jitter. Consumed (swapped false) by one task pass.
+    pub force: AtomicBool,
     wake: Condvar,
     wake_flag: Mutex<bool>,
 }
@@ -53,6 +57,7 @@ impl Default for OtaStatus {
             current_build: AtomicU32::new(FIRMWARE_BUILD),
             pending_build: AtomicU32::new(0),
             apply_at_ms: AtomicU32::new(0),
+            force: AtomicBool::new(false),
             wake: Condvar::new(),
             wake_flag: Mutex::new(false),
         }
@@ -117,10 +122,17 @@ fn ota_task(shared: SharedState) {
             )
         };
 
+        // The backend's `update_now` command: check off-interval and apply
+        // without the rollout jitter. It also overrides the auto-update opt-out
+        // — it is an explicit per-node operator action, not the unattended
+        // rollout that switch governs.
+        let forced = status.force.swap(false, Ordering::Relaxed);
+
         let now = uptime_ms();
         let last = status.last_check_ms.load(Ordering::Relaxed);
-        let due = last == 0 || now.wrapping_sub(last) >= interval_min.saturating_mul(60_000);
-        let ready = auto
+        let due =
+            forced || last == 0 || now.wrapping_sub(last) >= interval_min.saturating_mul(60_000);
+        let ready = (auto || forced)
             && !url.is_empty()
             && shared.wifi_connected.load(Ordering::Relaxed)
             && wifi::time_synced();
@@ -131,33 +143,45 @@ fn ota_task(shared: SharedState) {
                 Ok((build, version, bin_url, sha256)) => {
                     status.clear_err();
                     if build > FIRMWARE_BUILD {
-                        let pending = status.pending_build.load(Ordering::Relaxed);
-                        if pending != build {
-                            // First sighting: stagger the fleet with 0-6 h jitter.
-                            let jitter = unsafe { sys::esp_random() } % (6 * 3600 * 1000);
-                            let apply_at = uptime_ms().wrapping_add(jitter);
+                        if status.pending_build.load(Ordering::Relaxed) != build {
+                            // First sighting: stagger an unattended fleet-wide
+                            // rollout with 0-6 h of jitter. A forced update is
+                            // one operator acting on one node — no stagger.
+                            let jitter = if forced {
+                                0
+                            } else {
+                                (unsafe { sys::esp_random() }) % (6 * 3600 * 1000)
+                            };
                             status.pending_build.store(build, Ordering::Relaxed);
-                            status.apply_at_ms.store(apply_at, Ordering::Relaxed);
+                            status
+                                .apply_at_ms
+                                .store(uptime_ms().wrapping_add(jitter), Ordering::Relaxed);
                             log::info!(
                                 "[ota] build {build} (v{version}) available, applying in {} s",
                                 jitter / 1000
                             );
-                        } else {
-                            let apply_at = status.apply_at_ms.load(Ordering::Relaxed);
-                            if (uptime_ms().wrapping_sub(apply_at) as i32) >= 0 {
-                                log::info!("[ota] downloading build {build}");
-                                shared.ota_in_progress.store(true, Ordering::Relaxed);
-                                if download_and_flash(&bin_url, &token, &sha256, &shared, &status) {
-                                    log::info!("[ota] flashed, rebooting");
-                                    std::thread::sleep(Duration::from_millis(200));
-                                    esp_idf_svc::hal::reset::restart();
-                                } else {
-                                    shared.ota_in_progress.store(false, Ordering::Relaxed);
-                                    log::warn!(
-                                        "[ota] failed: {}",
-                                        status.last_error.lock().map(|s| s.clone()).unwrap_or_default()
-                                    );
-                                }
+                        } else if forced {
+                            // Already pending behind a jitter deadline — bring it forward.
+                            status.apply_at_ms.store(uptime_ms(), Ordering::Relaxed);
+                        }
+
+                        // Deadline check runs in the same pass as the scheduling
+                        // above, so a zero jitter applies now instead of waiting
+                        // for the next 30 s wakeup.
+                        let apply_at = status.apply_at_ms.load(Ordering::Relaxed);
+                        if (uptime_ms().wrapping_sub(apply_at) as i32) >= 0 {
+                            log::info!("[ota] downloading build {build}");
+                            shared.ota_in_progress.store(true, Ordering::Relaxed);
+                            if download_and_flash(&bin_url, &token, &sha256, &shared, &status) {
+                                log::info!("[ota] flashed, rebooting");
+                                std::thread::sleep(Duration::from_millis(200));
+                                esp_idf_svc::hal::reset::restart();
+                            } else {
+                                shared.ota_in_progress.store(false, Ordering::Relaxed);
+                                log::warn!(
+                                    "[ota] failed: {}",
+                                    status.last_error.lock().map(|s| s.clone()).unwrap_or_default()
+                                );
                             }
                         }
                     } else {

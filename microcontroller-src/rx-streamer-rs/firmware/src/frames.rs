@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -58,6 +58,11 @@ pub struct FrameRecord {
     pub route: Option<u16>,
     /// R09.0.7 only, hypothesis (see the C decoder_ffsk.h discussion)
     pub zuglaenge: Option<u8>,
+
+    /// Peak RF signal level during this telegram's burst, raw SA818 units
+    /// (0-255, **not** dBm — see [`RfRssi`]). `None` when the module does not
+    /// answer `RSSI?`, or when no sample landed inside the burst.
+    pub rssi: Option<u8>,
 }
 
 impl FrameRecord {
@@ -76,6 +81,7 @@ impl FrameRecord {
             destination: None,
             route: None,
             zuglaenge: None,
+            rssi: None,
         }
     }
 
@@ -130,6 +136,9 @@ fn log_frame(r: &FrameRecord) {
     if let Some(v) = r.zuglaenge {
         let _ = write!(fields, " zl={v}");
     }
+    if let Some(v) = r.rssi {
+        let _ = write!(fields, " rssi={v}");
+    }
 
     log::info!(
         "[tg] {} {} rep={}{} ({})",
@@ -139,6 +148,57 @@ fn log_frame(r: &FrameRecord) {
         fields,
         r.label
     );
+}
+
+/// RF signal level sampled from the SA818, shared between the poll task
+/// (producer) and the decoder (consumer).
+///
+/// **Raw module units, 0-255 — not dBm.** The SA818 answers `RSSI?` with an
+/// unscaled byte and documents no dBm mapping, so nothing here pretends to know
+/// one: the value is only meaningful *relatively* (this telegram vs. that one,
+/// this node vs. that node).
+///
+/// Peak-hold rather than "latest sample", because a telegram is short (~60 ms
+/// for VDV R09) and the decoder only builds the record once the burst has
+/// *ended* — an instantaneous read at that moment tends to land in the silence
+/// after the transmission. [`Self::take_peak`] therefore returns the strongest
+/// sample seen since the previous burst consumed it.
+///
+/// Both cells store `value + 1`, so 0 doubles as "no sample" and the whole thing
+/// stays lock-free (a real 0 reading is a legitimate value, not an absence).
+#[derive(Default)]
+pub struct RfRssi {
+    last: AtomicU16,
+    peak: AtomicU16,
+    /// Set once the module has proven it does not answer `RSSI?` (a genuine
+    /// DRA818 has no such command). Polling stops; records keep `rssi: None`.
+    pub unsupported: AtomicBool,
+}
+
+impl RfRssi {
+    /// Record one sample (poll task).
+    pub fn observe(&self, v: u8) {
+        let enc = v as u16 + 1;
+        self.last.store(enc, Ordering::Relaxed);
+        self.peak.fetch_max(enc, Ordering::Relaxed);
+    }
+
+    /// Most recent sample, for live status display.
+    pub fn last(&self) -> Option<u8> {
+        match self.last.load(Ordering::Relaxed) {
+            0 => None,
+            enc => Some((enc - 1) as u8),
+        }
+    }
+
+    /// Take (and clear) the peak since the last burst — call once per burst, so
+    /// every record decoded out of that burst carries the same level.
+    pub fn take_peak(&self) -> Option<u8> {
+        match self.peak.swap(0, Ordering::Relaxed) {
+            0 => None,
+            enc => Some((enc - 1) as u8),
+        }
+    }
 }
 
 /// Shared decode/uplink counters (C `stBursts`..`stAccepted` + last label).
@@ -169,6 +229,10 @@ pub struct Frames {
     queue_cv: Condvar,
     history: Mutex<VecDeque<FrameRecord>>,
     pub stats: FrameStats,
+    /// Lives here because `Frames` is the one object both the RSSI poll task and
+    /// the decoder already hold — no extra plumbing needed to get a sample from
+    /// the radio to the record it belongs to.
+    pub rssi: RfRssi,
 }
 
 impl Frames {
@@ -178,6 +242,7 @@ impl Frames {
             queue_cv: Condvar::new(),
             history: Mutex::new(VecDeque::with_capacity(TELEGRAM_HISTORY_SIZE)),
             stats: FrameStats::default(),
+            rssi: RfRssi::default(),
         }
     }
 

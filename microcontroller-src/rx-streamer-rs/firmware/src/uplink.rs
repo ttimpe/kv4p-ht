@@ -14,8 +14,25 @@
 //! while the uplink is down fresh telegrams win and stale ones are discarded
 //! (identical to the C v1 behavior). The config-generation counter
 //! (`gen.uplink`) drives hot-reconfigure exactly like the C `upCfgGen`.
+//!
+//! # Remote control (WebSocket mode only)
+//!
+//! The ingest socket is bidirectional, so it doubles as the downlink a rooftop
+//! node with no physical access is administered over. The backend pushes
+//! `{"type":"command",...}` documents (see [`crate::control`]); this task applies
+//! them and answers with `command_result`. It also pushes a `status` report on
+//! connect and every [`STATUS_EVERY`] — that report is what lets the backend
+//! render a channel picker for a node it has never been told the config of.
+//!
+//! Commands are *queued* by the WebSocket event callback and *applied* here on
+//! purpose: the callback runs on the client's own 6 kB ESP-IDF task, which has
+//! no room for a config apply (NVS write + radio re-tune).
+//!
+//! HTTP uplink mode has no downlink and therefore no remote control — a node
+//! must be on a `ws(s)://` uplink to be administered from the backend.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,9 +43,18 @@ use esp_idf_svc::ws::client::{
     EspWebSocketClient, EspWebSocketClientConfig, EspWebSocketTransport, FrameType,
     WebSocketEventType,
 };
+use serde_json::json;
 
+use crate::control;
 use crate::frames::{FrameRecord, Frames, FRAME_RAW_MAX};
 use crate::SharedState;
+
+/// How often a connected node re-reports its full state to the backend.
+pub const STATUS_EVERY: Duration = Duration::from_secs(30);
+
+/// Depth of the callback -> task command queue. Commands are operator actions,
+/// never bulk traffic; a backlog this deep already means the task is wedged.
+const CMD_QUEUE_DEPTH: usize = 8;
 
 /// Uplink status surfaced to `/api/status`, mirroring the C globals
 /// (`upMode`/`uplinkConnected()`/`upWsConnected`/`upHelloAcked`/`upLastError`).
@@ -170,11 +196,18 @@ fn burst_json(r: &FrameRecord, ws_wrap: bool) -> String {
     } else {
         String::new()
     };
+    // Raw SA818 units (0-255), NOT dBm — see frames::RfRssi. Omitted entirely
+    // when the module has no RSSI, which the backend reads as a null column
+    // rather than a bogus 0.
+    let rssi = match r.rssi {
+        Some(v) => format!(",\"rssi\":{v}"),
+        None => String::new(),
+    };
     let proto = r.proto_str();
     if ws_wrap {
-        format!("{{\"type\":\"burst\",\"raw_hex\":\"{hex}\",\"protocol\":\"{proto}\"{ts}}}")
+        format!("{{\"type\":\"burst\",\"raw_hex\":\"{hex}\",\"protocol\":\"{proto}\"{ts}{rssi}}}")
     } else {
-        format!("{{\"raw_hex\":\"{hex}\",\"protocol\":\"{proto}\"{ts}}}")
+        format!("{{\"raw_hex\":\"{hex}\",\"protocol\":\"{proto}\"{ts}{rssi}}}")
     }
 }
 
@@ -208,6 +241,11 @@ fn uplink_task(shared: SharedState) {
     let mut connect_stall_reported = false;
     let mut hello_stall_reported = false;
 
+    // Downlink commands, handed over from the WS callback (see module docs).
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<String>(CMD_QUEUE_DEPTH);
+    let mut status_sent_for_conn = false;
+    let mut last_status = Instant::now();
+
     loop {
         let g = shared.app.gen.uplink.load(Ordering::SeqCst);
         if g != applied_gen {
@@ -227,8 +265,9 @@ fn uplink_task(shared: SharedState) {
                     status.set_mode(mode.name());
                     if mode.is_ws() {
                         let path = format!("{}/ws/ingest", p.base_path);
-                        ws = build_ws_client(&p, &path, &token, &frames, &status);
+                        ws = build_ws_client(&p, &path, &token, &frames, &status, cmd_tx.clone());
                         hello_sent_for_conn = false;
+                        status_sent_for_conn = false;
                         connect_start = Instant::now();
                         connect_stall_reported = false;
                         status.ws_socket.store(false, Ordering::Relaxed);
@@ -288,6 +327,7 @@ fn uplink_task(shared: SharedState) {
                 log::info!("[uplink] ws connected, hello sent");
             } else if !connected && hello_sent_for_conn {
                 hello_sent_for_conn = false;
+                status_sent_for_conn = false;
                 connect_start = Instant::now();
                 connect_stall_reported = false;
             }
@@ -315,6 +355,32 @@ fn uplink_task(shared: SharedState) {
             let acked = status.hello_acked.load(Ordering::Relaxed);
             status.connected.store(acked, Ordering::Relaxed);
             if acked {
+                // Report on every fresh connection, then on the interval. The
+                // backend has no other way to learn this node's channel table.
+                if !status_sent_for_conn || last_status.elapsed() >= STATUS_EVERY {
+                    let report = control::status_report_json(&shared);
+                    if client.send(FrameType::Text(false), report.as_bytes()).is_ok() {
+                        status_sent_for_conn = true;
+                        last_status = Instant::now();
+                    }
+                }
+
+                // Downlink commands. Applied here, not in the WS callback: this
+                // task has the stack for an NVS write and a radio re-tune.
+                while let Ok(text) = cmd_rx.try_recv() {
+                    if let Some(reboot) = handle_command(&shared, client, &text) {
+                        if reboot {
+                            log::warn!("[uplink] rebooting on backend command");
+                            std::thread::sleep(Duration::from_millis(500));
+                            esp_idf_svc::hal::reset::restart();
+                        }
+                        // The command may have changed what we last reported;
+                        // re-report on the next pass rather than let the backend
+                        // show stale state for up to STATUS_EVERY.
+                        status_sent_for_conn = false;
+                    }
+                }
+
                 for r in frames.drain() {
                     let msg = burst_json(&r, true);
                     if client.send(FrameType::Text(false), msg.as_bytes()).is_ok() {
@@ -343,15 +409,50 @@ fn uplink_task(shared: SharedState) {
     }
 }
 
+/// Apply one queued downlink command and put its result on the wire. Returns
+/// `Some(reboot)` when the command was handled, `None` when it was unparseable
+/// (nothing to answer — there is no id to answer with).
+fn handle_command(
+    shared: &SharedState,
+    client: &mut EspWebSocketClient<'static>,
+    text: &str,
+) -> Option<bool> {
+    let doc: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[uplink] bad command json: {e}");
+            return None;
+        }
+    };
+    let id = doc.get("id").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let cmd = doc.get("cmd").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+
+    let outcome = control::dispatch(shared, &doc);
+    let reply = if outcome.ok {
+        log::info!("[uplink] command {id} ({cmd}) ok");
+        json!({"type":"command_result","id":id,"ok":true})
+    } else {
+        let e = outcome.error.clone().unwrap_or_default();
+        log::warn!("[uplink] command {id} ({cmd}) failed: {e}");
+        json!({"type":"command_result","id":id,"ok":false,"error":e})
+    };
+    // Sent before any reboot the command triggers, so the backend records the
+    // outcome instead of timing the command out.
+    let _ = client.send(FrameType::Text(false), reply.to_string().as_bytes());
+    Some(outcome.reboot)
+}
+
 /// Build (and start) the websocket client with a status-tracking event
 /// callback. The callback runs on the client's hidden ESP-IDF task and only
-/// captures `Arc` state, so it is `Send + 'static`.
+/// captures `Arc` state plus the command queue's sender, so it is
+/// `Send + 'static`.
 fn build_ws_client(
     p: &Parsed,
     path: &str,
     token: &str,
     frames: &Arc<Frames>,
     status: &Arc<UplinkStatus>,
+    cmd_tx: SyncSender<String>,
 ) -> Option<EspWebSocketClient<'static>> {
     let uri = format!(
         "{}://{}:{}{}",
@@ -379,7 +480,16 @@ fn build_ws_client(
                     log::info!("[uplink] ws disconnected");
                 }
                 WebSocketEventType::Text(txt) => {
-                    if txt.contains("\"hello_ack\"") {
+                    // Checked first: a command is the only message whose payload
+                    // is attacker-ish free-form (a config patch could itself
+                    // contain the substring `"ack"`).
+                    if txt.contains("\"command\"") {
+                        // Hand off to the uplink task — this callback runs on the
+                        // client's 6 kB task and must not apply config itself.
+                        if cmd_tx.try_send(txt.to_string()).is_err() {
+                            log::warn!("[uplink] command queue full, dropping");
+                        }
+                    } else if txt.contains("\"hello_ack\"") {
                         cb_status.hello_acked.store(true, Ordering::Relaxed);
                         cb_status.clear_err();
                         log::info!("[uplink] hello acked");
@@ -419,7 +529,16 @@ fn build_ws_client(
         network_timeout_ms: Duration::from_millis(10000),
         ping_interval_sec: Duration::from_secs(15),
         task_stack: 6144,
-        buffer_size: 1024,
+        // 2 kB (was 1 kB) so a downlink command arrives in a single frame.
+        // esp-idf-svc's event callback hands us one `Text` event per *frame*
+        // and exposes no offset/total, so a fragmented command would reach
+        // `handle_command` as truncated JSON and be rejected. Config patches and
+        // per-slot `channel` patches are a few hundred bytes; a full 32-entry
+        // `channels` table is ~2.5 kB and is the one command the backend must
+        // not send over the WS (it edits slots one at a time instead).
+        // Outbound is unaffected — the client chunks long sends itself, so the
+        // multi-kB status report goes out fine.
+        buffer_size: 2048,
         // TLS server-cert verification is skipped globally via sdkconfig
         // (CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY) — no CA bundle attached,
         // matching the C setInsecure() posture. Do NOT also set
