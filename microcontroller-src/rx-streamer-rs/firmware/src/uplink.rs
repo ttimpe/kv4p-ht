@@ -72,6 +72,14 @@ pub struct UplinkStatus {
     pub hello_acked: AtomicBool,
     /// Last error string, empty when none (C `upLastError`).
     pub last_error: Mutex<String>,
+    /// OTA asks the uplink to drop its TLS connection so a manifest/image fetch
+    /// can get a large-enough contiguous heap block for its own handshake — on a
+    /// WROOM there isn't room for two live TLS sessions plus the decoder buffers.
+    /// See [`suspended`](Self::suspended).
+    pub suspend: AtomicBool,
+    /// Set by the uplink task once it has actually torn its transport down and
+    /// released the heap; OTA waits on this before opening its connection.
+    pub suspended: AtomicBool,
 }
 
 impl UplinkStatus {
@@ -246,7 +254,35 @@ fn uplink_task(shared: SharedState) {
     let mut status_sent_for_conn = false;
     let mut last_status = Instant::now();
 
+    // OTA coordination: while OTA needs the heap, we hold no transport.
+    let mut suspended_local = false;
+
     loop {
+        // OTA wants the heap for its own TLS handshake. Drop ours (freeing the
+        // WS client's ESP-IDF task, buffers and mbedTLS session) and idle until
+        // OTA is done, then rebuild from config.
+        if shared.uplink.suspend.load(Ordering::Relaxed) {
+            if !suspended_local {
+                ws = None;
+                http = None;
+                status.connected.store(false, Ordering::Relaxed);
+                status.ws_socket.store(false, Ordering::Relaxed);
+                status.hello_acked.store(false, Ordering::Relaxed);
+                status.suspended.store(true, Ordering::Relaxed);
+                suspended_local = true;
+                log::info!("[uplink] suspended for OTA (transport released)");
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        } else if suspended_local {
+            suspended_local = false;
+            status.suspended.store(false, Ordering::Relaxed);
+            // Force the reconfigure block below to rebuild the transport: the
+            // generation counter has not changed, so make applied_gen mismatch.
+            applied_gen = applied_gen.wrapping_sub(1);
+            log::info!("[uplink] resumed after OTA");
+        }
+
         let g = shared.app.gen.uplink.load(Ordering::SeqCst);
         if g != applied_gen {
             applied_gen = g;

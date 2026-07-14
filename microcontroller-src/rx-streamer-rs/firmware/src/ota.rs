@@ -108,6 +108,36 @@ pub fn start(shared: SharedState) -> std::io::Result<()> {
     .map(|_| ())
 }
 
+/// Run an OTA network op with the uplink's TLS torn down, so the op's own
+/// handshake can get a large-enough contiguous heap block. Asks the uplink to
+/// suspend, waits (bounded) until it confirms the transport is released, runs
+/// `f`, then lets the uplink reconnect.
+///
+/// This is the fix for "manifest begin failed" on a WROOM: with the WS uplink
+/// live, the largest free block was ~14 kB while a TLS handshake needs far more,
+/// so every manifest fetch failed. The cost is a brief uplink blip per check —
+/// telegrams queue/drop for a few seconds — which only happens when a check is
+/// actually due.
+fn with_uplink_suspended<T>(shared: &SharedState, f: impl FnOnce() -> T) -> T {
+    let up = &shared.uplink;
+    up.suspend.store(true, Ordering::Relaxed);
+    // Wait for the uplink to actually drop its transport (up to ~3 s).
+    let deadline = uptime_ms().wrapping_add(3000);
+    while !up.suspended.load(Ordering::Relaxed)
+        && (uptime_ms().wrapping_sub(deadline) as i32) < 0
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Let esp-tls hand the freed blocks back to the allocator before we ask for
+    // a big contiguous one.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let r = f();
+
+    up.suspend.store(false, Ordering::Relaxed);
+    r
+}
+
 fn ota_task(shared: SharedState) {
     let status = shared.ota.clone();
 
@@ -139,7 +169,9 @@ fn ota_task(shared: SharedState) {
 
         if ready && due {
             status.last_check_ms.store(now, Ordering::Relaxed);
-            match fetch_manifest(&url, &token, &status) {
+            // Free the uplink's TLS heap for the manifest handshake.
+            let manifest = with_uplink_suspended(&shared, || fetch_manifest(&url, &token, &status));
+            match manifest {
                 Ok((build, version, bin_url, sha256)) => {
                     status.clear_err();
                     if build > FIRMWARE_BUILD {
@@ -172,7 +204,14 @@ fn ota_task(shared: SharedState) {
                         if (uptime_ms().wrapping_sub(apply_at) as i32) >= 0 {
                             log::info!("[ota] downloading build {build}");
                             shared.ota_in_progress.store(true, Ordering::Relaxed);
-                            if download_and_flash(&bin_url, &token, &sha256, &shared, &status) {
+                            // Same heap reason as the manifest, and more acute:
+                            // the image download's TLS + OTA write buffers must
+                            // not contend with a live WS session. On success this
+                            // reboots; on failure the uplink resumes.
+                            let flashed = with_uplink_suspended(&shared, || {
+                                download_and_flash(&bin_url, &token, &sha256, &shared, &status)
+                            });
+                            if flashed {
                                 log::info!("[ota] flashed, rebooting");
                                 std::thread::sleep(Duration::from_millis(200));
                                 esp_idf_svc::hal::reset::restart();

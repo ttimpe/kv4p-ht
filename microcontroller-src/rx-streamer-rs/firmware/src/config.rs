@@ -30,12 +30,12 @@ use esp_idf_svc::sys::{self, EspError};
 
 use crate::board::HwConfig;
 
-pub const FIRMWARE_VERSION: &str = "0.3.0";
+pub const FIRMWARE_VERSION: &str = "0.3.1";
 /// Monotonic OTA build number (independent of the human-readable
 /// [`FIRMWARE_VERSION`]). The auto-updater flashes a manifest build only when
 /// it is strictly greater than this. Starts at 100 per the migration plan so
 /// it stays ahead of the C firmware's build counter.
-pub const FIRMWARE_BUILD: u32 = 102;
+pub const FIRMWARE_BUILD: u32 = 103;
 
 // Stream format constants (config.h).
 pub const CAPTURE_SAMPLE_RATE: u32 = 48000;
