@@ -26,7 +26,7 @@
 //! between +hi and -hi, plus the zero crossing between two adjacent
 //! opposite-polarity half-waves, is what keeps consecutive AMI marks apart.
 
-use crate::{NEMO_BAUD_MAX, NEMO_BAUD_MIN, NEMO_FS2, NEMO_MAX_BITS};
+use crate::{NEMO_BAUD_MAX, NEMO_BAUD_MIN, NEMO_FS2, NEMO_MAX_BITS, NEMO_MAX_PULSES};
 
 /// One detected half-wave pulse: sample index of its peak, and its polarity.
 pub(crate) struct Pulse {
@@ -89,6 +89,11 @@ pub(crate) fn detect_pulses(x: &[i16], hyst_frac: f32, out: &mut Vec<Pulse>) {
     let mut best_at = 0usize;
 
     for (i, &xi) in x.iter().enumerate() {
+        // Full = the burst is noise-dense, not a telegram; stop rather than
+        // reallocate (the cap exists to bound heap, see NEMO_MAX_PULSES).
+        if out.len() >= NEMO_MAX_PULSES {
+            return;
+        }
         let v = xi as f32;
         match state {
             0 => {
@@ -127,7 +132,7 @@ pub(crate) fn detect_pulses(x: &[i16], hyst_frac: f32, out: &mut Vec<Pulse>) {
         }
     }
     // A pulse still open at the buffer's end still happened.
-    if state != 0 && seg0 < x.len() {
+    if state != 0 && seg0 < x.len() && out.len() < NEMO_MAX_PULSES {
         out.push(Pulse { at: best_at, pol: state });
     }
 }

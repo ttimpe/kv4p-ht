@@ -31,6 +31,9 @@
 //! HTTP uplink mode has no downlink and therefore no remote control — a node
 //! must be on a `ws(s)://` uplink to be administered from the backend.
 
+use std::collections::VecDeque;
+use std::io::{Read as _, Write as _};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
@@ -52,9 +55,49 @@ use crate::SharedState;
 /// How often a connected node re-reports its full state to the backend.
 pub const STATUS_EVERY: Duration = Duration::from_secs(30);
 
+/// Reconnect backoff for the owned WS reconnection loop. Doubles per failed
+/// attempt up to the max; resets on a successful socket. The floor keeps a
+/// flapping backend from pausing the decoder more often than every few
+/// seconds; the ceiling keeps a down backend from delaying recovery long.
+const WS_BACKOFF_MIN: Duration = Duration::from_secs(3);
+const WS_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// How long a handshake may sit without a CONNECTED event before the client
+/// is torn down and rebuilt (mirrors the C 12 s stall grace, plus margin).
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Depth of the callback -> task command queue. Commands are operator actions,
 /// never bulk traffic; a backlog this deep already means the task is wedged.
 const CMD_QUEUE_DEPTH: usize = 8;
+
+/// In-memory uplink event log for remote debugging (`GET /api/uplinklog`).
+/// Nodes are usually reachable only over HTTP, so the one-line `last_error`
+/// is not enough to diagnose a connect failure. Bounded ring; oldest drop.
+#[derive(Default)]
+pub struct UplinkLog {
+    entries: Mutex<VecDeque<String>>,
+}
+
+const UPLINK_LOG_CAP: usize = 64;
+
+impl UplinkLog {
+    pub fn push(&self, msg: &str) {
+        log::info!("[uplink] {msg}");
+        let t = crate::frames::uptime_ms();
+        if let Ok(mut e) = self.entries.lock() {
+            if e.len() >= UPLINK_LOG_CAP {
+                e.pop_front();
+            }
+            e.push_back(format!("[{}.{:03}s] {msg}", t / 1000, t % 1000));
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .map(|e| e.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
 
 /// Uplink status surfaced to `/api/status`, mirroring the C globals
 /// (`upMode`/`uplinkConnected()`/`upWsConnected`/`upHelloAcked`/`upLastError`).
@@ -80,6 +123,8 @@ pub struct UplinkStatus {
     /// Set by the uplink task once it has actually torn its transport down and
     /// released the heap; OTA waits on this before opening its connection.
     pub suspended: AtomicBool,
+    /// Debug event ring (`GET /api/uplinklog`).
+    pub log: UplinkLog,
 }
 
 impl UplinkStatus {
@@ -124,6 +169,7 @@ impl Mode {
     }
 }
 
+#[derive(Clone)]
 struct Parsed {
     mode: Mode,
     host: String,
@@ -219,6 +265,59 @@ fn burst_json(r: &FrameRecord, ws_wrap: bool) -> String {
     }
 }
 
+/// Transport-level probe, logged to the debug ring: DNS, TCP connect, and (for
+/// plain `ws://`) the server's literal answer to a WebSocket upgrade. Runs
+/// before each client build and on connect stalls, so a remote operator can
+/// tell a DNS failure from a refused port from an HTTP redirect without serial
+/// access. Heap cost is one 256 B stack buffer and short strings.
+fn probe_endpoint(host: &str, port: u16, path: &str, tls: bool, log: &UplinkLog) {
+    let addr = match format!("{host}:{port}").to_socket_addrs() {
+        Ok(mut a) => match a.next() {
+            Some(a) => a,
+            None => {
+                log.push(&format!("probe: dns {host}: no addresses"));
+                return;
+            }
+        },
+        Err(e) => {
+            log.push(&format!("probe: dns {host} failed: {e}"));
+            return;
+        }
+    };
+    log.push(&format!("probe: dns {host} -> {addr}"));
+    let mut sock = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+        Ok(s) => s,
+        Err(e) => {
+            log.push(&format!("probe: tcp {addr} failed: {e}"));
+            return;
+        }
+    };
+    log.push(&format!("probe: tcp {addr} ok"));
+    if tls {
+        return; // esp-tls owns the TLS layer; nothing more to see from here
+    }
+    let p = if path.is_empty() { "/" } else { path };
+    let req = format!(
+        "GET {p} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: a3Y0cC1kZWJ1Zy1wcm9iZQ==\r\n\r\n"
+    );
+    let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
+    if let Err(e) = sock.write_all(req.as_bytes()) {
+        log.push(&format!("probe: send failed: {e}"));
+        return;
+    }
+    let mut buf = [0u8; 256];
+    match sock.read(&mut buf) {
+        Ok(0) => log.push("probe: server closed without answering upgrade"),
+        Ok(n) => {
+            let head = String::from_utf8_lossy(&buf[..n]);
+            let line = head.lines().next().unwrap_or("").to_string();
+            log.push(&format!("probe: upgrade answer: {line}"));
+        }
+        Err(e) => log.push(&format!("probe: read failed: {e}")),
+    }
+}
+
 /// Spawn the uplink task (core 0, stack 12288, priority 1 — C `uplinkStart`).
 pub fn start(shared: SharedState) -> std::io::Result<()> {
     crate::rt::spawn(b"uplink\0", 12288, 1, esp_idf_svc::hal::cpu::Core::Core0, move || {
@@ -241,12 +340,19 @@ fn uplink_task(shared: SharedState) {
     let mut http: Option<EspHttpConnection> = None;
     let mut last_post = Instant::now();
 
-    // WS transport state (the client owns a hidden ESP-IDF task; keep it alive).
+    // WS transport state (the client owns a hidden ESP-IDF task; keep it
+    // alive). Reconnection is owned HERE, not by the client (auto-reconnect
+    // is disabled): every TLS handshake must go through the decoder-pause
+    // sequence, and the client's internal retry loop cannot do that.
     let mut ws: Option<EspWebSocketClient<'static>> = None;
+    let mut ws_endpoint: Option<Parsed> = None;
+    let mut ws_path = String::new();
+    let mut ws_next_attempt = Instant::now();
+    let mut ws_backoff = WS_BACKOFF_MIN;
+    let mut dec_paused = false;
     let mut hello_sent_for_conn = false;
     let mut connect_start = Instant::now();
     let mut hello_sent_at = Instant::now();
-    let mut connect_stall_reported = false;
     let mut hello_stall_reported = false;
 
     // Downlink commands, handed over from the WS callback (see module docs).
@@ -257,6 +363,12 @@ fn uplink_task(shared: SharedState) {
     // OTA coordination: while OTA needs the heap, we hold no transport.
     let mut suspended_local = false;
 
+    // Last parsed endpoint, kept for the stall-triggered re-probe.
+    let mut probe_host = String::new();
+    let mut probe_port = 0u16;
+    let mut probe_path = String::new();
+    let mut probe_tls = false;
+
     loop {
         // OTA wants the heap for its own TLS handshake. Drop ours (freeing the
         // WS client's ESP-IDF task, buffers and mbedTLS session) and idle until
@@ -265,6 +377,10 @@ fn uplink_task(shared: SharedState) {
             if !suspended_local {
                 ws = None;
                 http = None;
+                if dec_paused {
+                    crate::decoder::resume(&shared.decoder);
+                    dec_paused = false;
+                }
                 status.connected.store(false, Ordering::Relaxed);
                 status.ws_socket.store(false, Ordering::Relaxed);
                 status.hello_acked.store(false, Ordering::Relaxed);
@@ -289,6 +405,11 @@ fn uplink_task(shared: SharedState) {
             // Tear down whatever is running and re-parse the config.
             ws = None;
             http = None;
+            ws_endpoint = None;
+            if dec_paused {
+                crate::decoder::resume(&shared.decoder);
+                dec_paused = false;
+            }
             let (url, tok) = {
                 let cfg = shared.app.config.read().unwrap();
                 (cfg.uplink_url.clone(), cfg.uplink_token.clone())
@@ -301,20 +422,27 @@ fn uplink_task(shared: SharedState) {
                     status.set_mode(mode.name());
                     if mode.is_ws() {
                         let path = format!("{}/ws/ingest", p.base_path);
-                        ws = build_ws_client(&p, &path, &token, &frames, &status, cmd_tx.clone());
-                        hello_sent_for_conn = false;
-                        status_sent_for_conn = false;
-                        connect_start = Instant::now();
-                        connect_stall_reported = false;
-                        status.ws_socket.store(false, Ordering::Relaxed);
-                        status.hello_acked.store(false, Ordering::Relaxed);
-                        log::info!(
-                            "[uplink] mode={} host={} port={} path={}",
+                        status.log.push(&format!(
+                            "config: mode={} host={} port={} path={} token={}B heap={}",
                             mode.name(),
                             p.host,
                             p.port,
-                            path
-                        );
+                            path,
+                            token.len(),
+                            unsafe { sys::esp_get_free_heap_size() },
+                        ));
+                        probe_host = p.host.clone();
+                        probe_port = p.port;
+                        probe_path = path.clone();
+                        probe_tls = p.mode == Mode::Wss;
+                        // The connect loop below builds the client (through
+                        // the decoder-pause sequence); connect immediately.
+                        ws_path = path;
+                        ws_endpoint = Some(p);
+                        ws_next_attempt = Instant::now();
+                        ws_backoff = WS_BACKOFF_MIN;
+                        status.ws_socket.store(false, Ordering::Relaxed);
+                        status.hello_acked.store(false, Ordering::Relaxed);
                     } else {
                         let scheme = if mode == Mode::Https { "https" } else { "http" };
                         ingest_url =
@@ -347,37 +475,107 @@ fn uplink_task(shared: SharedState) {
         }
 
         if mode.is_ws() {
-            let Some(client) = ws.as_mut() else {
-                std::thread::sleep(Duration::from_millis(250));
-                continue;
-            };
+            // Owned (re)connect: pause the decoder so the TLS handshake gets
+            // its ~35 kB transient, build the client, resume once the socket
+            // is up (steady-state session + demod state fit together).
+            if ws.is_none() {
+                if Instant::now() < ws_next_attempt {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                let Some(p) = ws_endpoint.clone() else {
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                };
+                if probe_tls && !dec_paused {
+                    crate::decoder::pause_for_tls(&shared.decoder);
+                    dec_paused = true;
+                    status.log.push(&format!(
+                        "decoder paused for handshake, heap={} maxblk={}",
+                        unsafe { sys::esp_get_free_heap_size() },
+                        unsafe {
+                            sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_8BIT)
+                        },
+                    ));
+                }
+                probe_endpoint(&probe_host, probe_port, &probe_path, probe_tls, &status.log);
+                ws = build_ws_client(&p, &ws_path, &token, &frames, &status, cmd_tx.clone());
+                connect_start = Instant::now();
+                hello_sent_for_conn = false;
+                status_sent_for_conn = false;
+                status.ws_socket.store(false, Ordering::Relaxed);
+                status.hello_acked.store(false, Ordering::Relaxed);
+                if ws.is_none() {
+                    if dec_paused {
+                        crate::decoder::resume(&shared.decoder);
+                        dec_paused = false;
+                    }
+                    ws_next_attempt = Instant::now() + ws_backoff;
+                    ws_backoff = (ws_backoff * 2).min(WS_BACKOFF_MAX);
+                    continue;
+                }
+            }
+
             let connected = status.ws_socket.load(Ordering::Relaxed);
+
+            // Handshake stuck: tear down and rebuild on backoff. The client
+            // is not auto-reconnecting, so this loop is the only retry path.
+            if !connected && connect_start.elapsed() > WS_CONNECT_TIMEOUT {
+                status.set_err("ws: connect timed out");
+                status.log.push(&format!(
+                    "connect timeout after {}s, rebuilding (backoff {}s)",
+                    WS_CONNECT_TIMEOUT.as_secs(),
+                    ws_backoff.as_secs()
+                ));
+                ws = None;
+                if dec_paused {
+                    crate::decoder::resume(&shared.decoder);
+                    dec_paused = false;
+                }
+                ws_next_attempt = Instant::now() + ws_backoff;
+                ws_backoff = (ws_backoff * 2).min(WS_BACKOFF_MAX);
+                continue;
+            }
+
+            // Socket up: the handshake's transient heap is free again; let
+            // the decoder rebuild while the session stays up.
+            if connected && dec_paused {
+                crate::decoder::resume(&shared.decoder);
+                dec_paused = false;
+                ws_backoff = WS_BACKOFF_MIN;
+                status.log.push(&format!("decoder resumed, heap={}", unsafe {
+                    sys::esp_get_free_heap_size()
+                }));
+            }
+
+            let client = ws.as_mut().unwrap();
 
             // Rising edge: socket up -> (re)send hello. Falling edge: reset.
             if connected && !hello_sent_for_conn {
                 let hello = format!("{{\"type\":\"hello\",\"station_key\":\"{token}\"}}");
-                let _ = client.send(FrameType::Text(false), hello.as_bytes());
+                match client.send(FrameType::Text(false), hello.as_bytes()) {
+                    Ok(()) => status.log.push("hello sent"),
+                    Err(e) => status.log.push(&format!("hello send failed: {e:?}")),
+                }
                 hello_sent_for_conn = true;
                 hello_sent_at = Instant::now();
                 hello_stall_reported = false;
-                log::info!("[uplink] ws connected, hello sent");
             } else if !connected && hello_sent_for_conn {
+                // Falling edge: the socket dropped. No auto-reconnect — tear
+                // the client down and let the owned connect loop rebuild it
+                // (with the decoder paused) after the backoff.
                 hello_sent_for_conn = false;
                 status_sent_for_conn = false;
-                connect_start = Instant::now();
-                connect_stall_reported = false;
+                status.log.push(&format!(
+                    "ws dropped, rebuilding in {}s",
+                    ws_backoff.as_secs()
+                ));
+                ws = None;
+                ws_next_attempt = Instant::now() + ws_backoff;
+                ws_backoff = (ws_backoff * 2).min(WS_BACKOFF_MAX);
+                continue;
             }
 
-            // Stall detection (the underlying client silently retries forever on
-            // a stuck lower-level handshake). Mirrors the C 12 s / 8 s grace.
-            if !connected
-                && !connect_stall_reported
-                && connect_start.elapsed() > Duration::from_secs(12)
-            {
-                connect_stall_reported = true;
-                status.set_err("ws: connect stuck (no handshake, check TLS/heap)");
-                log::warn!("[uplink] ws connect stalled: no CONNECTED event within 12s");
-            }
             if connected
                 && !status.hello_acked.load(Ordering::Relaxed)
                 && !hello_stall_reported
@@ -385,7 +583,7 @@ fn uplink_task(shared: SharedState) {
             {
                 hello_stall_reported = true;
                 status.set_err("ws: connected but no hello_ack (server silent)");
-                log::warn!("[uplink] hello stalled: no hello_ack/error within 8s");
+                status.log.push("stall: connected but no hello_ack/error within 8s");
             }
 
             let acked = status.hello_acked.load(Ordering::Relaxed);
@@ -437,7 +635,17 @@ fn uplink_task(shared: SharedState) {
         if waiting >= 8 || (waiting > 0 && last_post.elapsed() > Duration::from_secs(1)) {
             let batch = frames.drain();
             if !batch.is_empty() {
+                // A fresh https connection means a TLS handshake — same heap
+                // collision as the wss connect; pause the decoder around it.
+                // Keep-alive posts (http != None) skip the pause.
+                let fresh_tls = mode == Mode::Https && http.is_none();
+                if fresh_tls {
+                    crate::decoder::pause_for_tls(&shared.decoder);
+                }
                 post_batch(&mut http, &ingest_url, &token, &batch, &frames, &status);
+                if fresh_tls {
+                    crate::decoder::resume(&shared.decoder);
+                }
                 last_post = Instant::now();
             }
         }
@@ -509,11 +717,12 @@ fn build_ws_client(
                 WebSocketEventType::Connected => {
                     cb_status.ws_socket.store(true, Ordering::Relaxed);
                     cb_status.hello_acked.store(false, Ordering::Relaxed);
+                    cb_status.log.push("ws event: connected (socket+upgrade up)");
                 }
                 WebSocketEventType::Disconnected | WebSocketEventType::Closed => {
                     cb_status.ws_socket.store(false, Ordering::Relaxed);
                     cb_status.hello_acked.store(false, Ordering::Relaxed);
-                    log::info!("[uplink] ws disconnected");
+                    cb_status.log.push("ws event: disconnected/closed");
                 }
                 WebSocketEventType::Text(txt) => {
                     // Checked first: a command is the only message whose payload
@@ -528,7 +737,7 @@ fn build_ws_client(
                     } else if txt.contains("\"hello_ack\"") {
                         cb_status.hello_acked.store(true, Ordering::Relaxed);
                         cb_status.clear_err();
-                        log::info!("[uplink] hello acked");
+                        cb_status.log.push("hello acked");
                     } else if txt.contains("\"ack\"") {
                         if let Some(n) = parse_accepted(txt) {
                             cb_frames.stats.accepted.fetch_add(n, Ordering::Relaxed);
@@ -543,13 +752,20 @@ fn build_ws_client(
                         }
                         e.truncate(cut);
                         cb_status.set_err(&e);
-                        log::warn!("[uplink] ws error: {txt}");
+                        let mut t = txt.to_string();
+                        t.truncate(160);
+                        cb_status.log.push(&format!("server error msg: {t}"));
                     }
                 }
                 _ => {}
             },
-            Err(_) => {
-                cb_status.set_err("ws error");
+            // The whole point of the debug build: keep the actual error.
+            Err(e) => {
+                let msg = format!("ws event: ERROR {e:?}");
+                cb_status.log.push(&msg);
+                let mut short = msg;
+                short.truncate(63);
+                cb_status.set_err(&short);
             }
         }
     };
@@ -561,6 +777,10 @@ fn build_ws_client(
             EspWebSocketTransport::TransportOverTCP
         },
         headers: headers.as_deref(),
+        // The uplink task owns reconnection: every handshake must run with
+        // the decoder paused (heap), which the client's internal retry loop
+        // cannot arrange. See the connect loop in uplink_task.
+        disable_auto_reconnect: true,
         reconnect_timeout_ms: Duration::from_millis(5000),
         network_timeout_ms: Duration::from_millis(10000),
         ping_interval_sec: Duration::from_secs(15),
@@ -586,10 +806,13 @@ fn build_ws_client(
     };
 
     match EspWebSocketClient::new(&uri, &config, Duration::from_secs(5), cb) {
-        Ok(c) => Some(c),
+        Ok(c) => {
+            status.log.push(&format!("ws client started, uri={uri}"));
+            Some(c)
+        }
         Err(e) => {
             status.set_err("ws init failed");
-            log::error!("[uplink] ws client init failed: {e:?}");
+            status.log.push(&format!("ws client init FAILED: {e:?}"));
             None
         }
     }

@@ -121,6 +121,9 @@ pub fn start(shared: SharedState) -> std::io::Result<()> {
 fn with_uplink_suspended<T>(shared: &SharedState, f: impl FnOnce() -> T) -> T {
     let up = &shared.uplink;
     up.suspend.store(true, Ordering::Relaxed);
+    // The decoder's demod state (NEMO: ~13 kB) competes for the same heap;
+    // drop it for the duration of the fetch as well.
+    crate::decoder::pause_for_tls(&shared.decoder);
     // Wait for the uplink to actually drop its transport (up to ~3 s).
     let deadline = uptime_ms().wrapping_add(3000);
     while !up.suspended.load(Ordering::Relaxed)
@@ -135,6 +138,7 @@ fn with_uplink_suspended<T>(shared: &SharedState, f: impl FnOnce() -> T) -> T {
     let r = f();
 
     up.suspend.store(false, Ordering::Relaxed);
+    crate::decoder::resume(&shared.decoder);
     r
 }
 

@@ -65,6 +65,28 @@ pub fn start(shared: SharedState) -> anyhow::Result<EspHttpServer<'static>> {
         resp_json(req, 200, &control::config_json(&s))
     })?;
 
+    // Debug: the uplink's event ring (connect attempts, probes, real errors).
+    let s = shared.clone();
+    server.fn_handler("/api/uplinklog", Method::Get, move |req| -> anyhow::Result<()> {
+        resp_json(req, 200, &json!({ "log": s.uplink.log.snapshot() }).to_string())
+    })?;
+
+    // Debug: last crash (from RTC memory, survives the reboot) + reset reason.
+    server.fn_handler("/api/crashlog", Method::Get, move |req| -> anyhow::Result<()> {
+        let last = crate::crashlog::last_crash().map(|(kind, up, msg)| {
+            json!({
+                "kind": crate::crashlog::kind_str(kind),
+                "uptimeMs": up,
+                "msg": msg,
+            })
+        });
+        let body = json!({
+            "resetReason": crate::crashlog::reset_reason(),
+            "lastCrash": last,
+        });
+        resp_json(req, 200, &body.to_string())
+    })?;
+
     let s = shared.clone();
     server.fn_handler("/api/config", Method::Post, move |mut req| -> anyhow::Result<()> {
         if !auth_ok(&req, &s) {

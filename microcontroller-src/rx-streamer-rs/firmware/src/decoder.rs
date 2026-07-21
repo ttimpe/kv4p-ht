@@ -13,7 +13,7 @@
 //! raw (checkable) bytes for the uplink, R09 field extraction into
 //! [`FrameRecord`], and the NEMO within-burst dedup.
 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,6 +57,33 @@ pub enum AudioFrame {
 pub struct DecoderShared {
     pub requested_proto: AtomicU8,
     pub feed_drops: AtomicU32,
+    /// A TLS user (wss uplink handshake, https batch, OTA fetch) asks the
+    /// decoder to drop its demodulator state — the NEMO front-end alone holds
+    /// ~13 kB heap that a WROOM cannot spare while mbedTLS sets up a session.
+    /// The decoder acks via [`suspended`](Self::suspended) once the memory is
+    /// actually free and rebuilds its state when the flag clears (same
+    /// contract as the OTA↔uplink suspend pair in `uplink.rs`).
+    pub suspend: AtomicBool,
+    pub suspended: AtomicBool,
+}
+
+/// Ask the decoder to release its demod state and wait (bounded) until it has.
+/// Call from the task that is about to open a TLS connection; pair with
+/// [`resume`]. Waiting is best-effort: after 2 s the caller proceeds anyway —
+/// a wedged decoder must not also take the uplink down.
+pub fn pause_for_tls(shared: &DecoderShared) {
+    shared.suspend.store(true, Ordering::SeqCst);
+    let t0 = std::time::Instant::now();
+    while !shared.suspended.load(Ordering::SeqCst)
+        && t0.elapsed() < Duration::from_secs(2)
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Let the decoder rebuild its demod state (after the TLS handshake settled).
+pub fn resume(shared: &DecoderShared) {
+    shared.suspend.store(false, Ordering::SeqCst);
 }
 
 /// Audio-pump side (core 1): copy the frame the active protocol wants into
@@ -126,16 +153,43 @@ fn decoder_task(
     shared: &DecoderShared,
     rx: &Receiver<AudioFrame>,
 ) {
-    // Search-mode repairer: same repairs as the table mode with a fraction of
-    // the memory (the O(nbits^2) search only runs on CRC failures).
-    let repairer = Repairer::new_search(true);
+    // Search-mode repairer (the crate's only mode now): repairs run on CRC
+    // failures only, no repair table held in RAM.
+    let repairer = Repairer::new(true);
 
     let mut applied_gen = 0u32;
     let mut active = PROTO_NONE;
     let mut ffsk: Option<FfskState> = None;
     let mut nemo: Option<NemoDecoder> = None;
+    let mut paused = false;
 
     loop {
+        // TLS pause: drop the demod state so a handshake elsewhere gets the
+        // heap; ack via `suspended`, rebuild when the flag clears. The audio
+        // pump stops copying frames because requested_proto reads NONE.
+        if shared.suspend.load(Ordering::SeqCst) {
+            if !paused {
+                paused = true;
+                ffsk = None;
+                nemo = None;
+                active = PROTO_NONE;
+                shared.requested_proto.store(PROTO_NONE, Ordering::Relaxed);
+                while rx.try_recv().is_ok() {}
+                let heap = unsafe { sys::esp_get_free_heap_size() };
+                log::info!("[decoder] paused for TLS, demod state freed, heap={heap}");
+                shared.suspended.store(true, Ordering::SeqCst);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        } else if paused {
+            paused = false;
+            shared.suspended.store(false, Ordering::SeqCst);
+            // Force the re-apply below to rebuild the decoder for the active
+            // channel (the generation counter itself has not changed).
+            applied_gen = applied_gen.wrapping_sub(1);
+            log::info!("[decoder] resumed");
+        }
+
         // Config hot-reload: re-read the active channel/VFO protocol and swap
         // decoder state (C decoderReconfigure + decApplyProto).
         let g = state.gen.decoder.load(Ordering::SeqCst);
@@ -277,7 +331,8 @@ fn decode_ffsk_burst(bits: &[u8], repairer: &Repairer, frames: &Frames, rssi: Op
 /// `decFfskBitSink` copied `FfskResult` fields:
 ///   * `raw` = telegram incl. de-inverted CRC (checkable form),
 ///   * R09.14/16 -> label "R09.<type>", line/run/meldepunkt (+destination on 16),
-///   * R09.0.7 -> conjectured field extraction per the C `ffskR0907Valid`,
+///   * R09.0.7 -> the crate's native vendor-telegram parse (line/route/run/
+///     meldepunkt/zuglaenge — the field extraction that used to live here),
 ///   * anything else -> label only ("R09.x.y" / "C09.x.y" / "Rnn" / "Cnn").
 fn ffsk_record(hit: &FfskHit) -> FrameRecord {
     let mut r = FrameRecord::new(PROTO_FFSK_VDV);
@@ -292,50 +347,23 @@ fn ffsk_record(hit: &FfskHit) -> FrameRecord {
             r.meldepunkt = Some(t.reporting_point);
             r.destination = t.destination.map(|d| d as u16);
         }
-        Telegram::Raw { label, data } => {
-            // The crate appends an experimental annotation to R09.0.7 labels
-            // ("R09.0.7 [exp: ...]"); the C label was the bare "R09.0.7".
+        Telegram::R09_0_7(t) => {
+            r.label = "R09.0.7".to_string();
+            r.line = Some(t.line as u16);
+            r.run = Some(t.run as u8);
+            r.route = Some(t.route as u16);
+            r.meldepunkt = Some(t.reporting_point);
+            r.zuglaenge = Some(t.train_length);
+        }
+        Telegram::Raw { label, data: _ } => {
             r.label = label
                 .split_whitespace()
                 .next()
                 .unwrap_or_default()
                 .to_string();
-            extract_r09_0_7(data, &mut r);
         }
     }
     r
-}
-
-fn bcd(digits: &[u8]) -> Option<u32> {
-    digits.iter().try_fold(0u32, |acc, &d| {
-        (d <= 9).then_some(acc * 10 + u32::from(d))
-    })
-}
-
-/// Conjectured vendor R09.0.7 field extraction, port of the C
-/// `ffskR0907Valid` (see decoder_ffsk.h for the full confidence discussion:
-/// route and meldepunkt confirmed against real traffic 2026-07-12, line's
-/// byte-3 digits and zuglaenge bits[4:3] still hypotheses). All-or-nothing:
-/// any non-BCD digit leaves every field unset, like the C.
-fn extract_r09_0_7(data: &[u8], r: &mut FrameRecord) {
-    // Mode 9, type 0, payload length 7 -> 3-byte head + 7 = 10 bytes.
-    if data.len() != 10 || data[0] != 0x90 || data[1] & 0xf != 7 {
-        return;
-    }
-    let Some(line) = bcd(&[data[3] >> 4, data[3] & 0xf, data[4] >> 4]) else {
-        return;
-    };
-    let Some(route) = bcd(&[data[4] & 0xf, data[5] >> 4, data[5] & 0xf]) else {
-        return;
-    };
-    let Some(run) = bcd(&[data[8] >> 4, data[8] & 0xf]) else {
-        return;
-    };
-    r.line = Some(line as u16);
-    r.run = Some(run as u8);
-    r.route = Some(route as u16);
-    r.meldepunkt = Some(u16::from_be_bytes([data[6], data[7]]));
-    r.zuglaenge = Some((data[9] >> 3) & 0x3);
 }
 
 // --- NEMO sink (C decNemoFrameSink) ---

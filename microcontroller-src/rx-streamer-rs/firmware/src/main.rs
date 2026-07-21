@@ -11,11 +11,14 @@
 //! at the marked spawn points; everything they need is grouped in
 //! [`SharedState`].
 
+#![feature(alloc_error_hook)] // debug build: capture OOM aborts to RTC memory
+
 mod audio;
 mod board;
 mod broadcast_ring;
 mod config;
 mod control;
+mod crashlog;
 mod decoder;
 mod frames;
 mod ota;
@@ -90,12 +93,22 @@ fn main() -> anyhow::Result<()> {
     // Required by esp-idf-sys to keep runtime patches from being stripped.
     sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    crashlog::init();
 
     log::info!(
         "===== kv4p RX streamer v{} (build {}) =====",
         config::FIRMWARE_VERSION,
         config::FIRMWARE_BUILD
     );
+    log::info!("[boot] reset reason: {}", crashlog::reset_reason());
+    if let Some((kind, up, msg)) = crashlog::last_crash() {
+        log::warn!(
+            "[boot] last crash ({}, at t+{}ms): {}",
+            crashlog::kind_str(kind),
+            up,
+            msg
+        );
+    }
 
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;

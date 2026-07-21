@@ -86,9 +86,19 @@ pub(crate) const NEMO_LP_CORNER: f32 = 3400.0; // upperCornerFrequencyRxData
 pub(crate) const NEMO_BAUD_MIN: f32 = 3600.0;
 pub(crate) const NEMO_BAUD_MAX: f32 = 5400.0;
 
-pub(crate) const NEMO_SIG_MAX: usize = 9000; // 375 ms of 24 kHz bipolar signal (int16) = 18 kB
+/// 200 ms of 24 kHz bipolar signal (int16) = 9.6 kB. A telegram is 12-35 ms
+/// on air, so this still holds a multi-telegram burst; a longer carrier is
+/// simply split into successive windows (the gate reopens immediately). Was
+/// 375 ms / 18 kB — halved because the buffer has to coexist with a live TLS
+/// session in ~49 kB of free heap on the node.
+pub(crate) const NEMO_SIG_MAX: usize = 4800;
 pub(crate) const NEMO_PRE: usize = 256; // ~10.7 ms preroll kept before gate-open
 pub(crate) const NEMO_MAX_BITS: usize = 2048;
+/// Hard cap on detected pulses per burst. A real telegram needs well under
+/// 200; dense noise can trip the Schmitt comparator every few samples, and an
+/// uncapped Vec then reallocates to 16 kB+ mid-decode — a transient heap
+/// spike the node cannot afford (allocation failure aborts the firmware).
+pub(crate) const NEMO_MAX_PULSES: usize = 512;
 
 /// Shortest burst worth decoding: ~10 ms @ 24 kHz.
 ///
@@ -134,7 +144,7 @@ impl NemoDecoder {
             front: Frontend::new(),
             bits: vec![0u8; NEMO_MAX_BITS].into_boxed_slice(),
             scratch: vec![0u8; NEMO_MAX_BITS].into_boxed_slice(),
-            pulses: Vec::with_capacity(512),
+            pulses: Vec::with_capacity(NEMO_MAX_PULSES),
             bursts: 0,
         }
     }
